@@ -35,13 +35,13 @@ zg 'foo(\d+)' -r 'bar$1'      # with capture groups
 
 # Filter files (simple substring matching, no globs!)
 zg pattern -x test            # skip paths containing "test"
-zg pattern -x log,dist,vendor # skip multiple
-zg pattern -o clj             # only paths containing "clj"
-zg pattern -o clj -x test     # combine: clj files, skip tests
+zg pattern -x log -x dist -x vendor # skip multiple
+zg pattern -g clj             # only paths containing "clj"
+zg pattern -g clj -x test     # combine: clj files, skip tests
 
 # Options
 zg pattern -i                 # case insensitive
-zg pattern -C 3               # show 3 lines of context
+zg pattern -C 3               # show 3 lines of context, also see -A, -B
 zg pattern -q                 # quiet, exit code only
 zg pattern --count            # just show match count
 zg pattern --abs              # absolute paths in output
@@ -58,6 +58,8 @@ zg pattern -g .clj            # matches .clj, .cljs, .cljc
 ```
 
 Or globs if you need more power. 
+
+Also: -f searches for pattern in file names. 
 
 ## Dry Run
 
