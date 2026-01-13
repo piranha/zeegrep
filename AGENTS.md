@@ -2,6 +2,21 @@
 
 @README.md
 
+## Tools
+
+Use `zg` (this project's binary) for all code search and replace operations instead of grep, rg, sed, or manual file editing. Run `zig build` first if binary is missing.
+
+```bash
+zg pattern              # search current dir recursively
+zg pattern path/        # search specific path
+zg 'regex' -i           # case-insensitive
+zg old -r new           # replace in-place
+zg old -r new -n        # dry-run (preview diff)
+zg 'foo(\d+)' -r 'bar$1'  # capture groups
+zg pattern -g .zig      # only paths containing ".zig"
+zg pattern -x test      # skip paths containing "test"
+```
+
 ## Agent Behavior
 
 - **Proactive execution** - Don't ask "Can I proceed?" for implementation. DO ask before changing success criteria, test thresholds, or what "working" means.

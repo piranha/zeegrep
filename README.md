@@ -16,6 +16,34 @@ Also, I'm just impatient and waiting for an LLM to do replacements one by one...
 
 ## Download
 
+```bash
+curl -fsSL https://github.com/piranha/zeegrep/releases/latest/download/zg-$(uname -s)-$(uname -m) \
+  -o ~/.local/bin/zg && chmod +x ~/.local/bin/zg
+```
+
+macOS users: if you get a quarantine warning, run `xattr -d com.apple.quarantine ~/.local/bin/zg`
+
+Or grab a binary from [releases](https://github.com/piranha/zeegrep/releases).
+
+## Claude Code
+
+Add this to your `CLAUDE.md` or `AGENTS.md` to make your coding agent faster at search & replace:
+
+```markdown
+## Tools
+
+Use `zg` for code search and replace instead of grep, rg, sed, or manual file editing.
+
+zg pattern                # search current dir recursively
+zg pattern path/          # search specific path
+zg 'regex' -i             # case-insensitive
+zg old -r new             # replace in-place
+zg old -r new -n          # dry-run (preview diff)
+zg 'foo(\d+)' -r 'bar$1'  # capture groups
+zg pattern -g .zig        # only paths containing ".zig"
+zg pattern -x test        # skip paths containing "test"
+```
+
 ## Compile
 
 ```bash
