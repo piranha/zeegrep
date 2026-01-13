@@ -1,7 +1,7 @@
 # zeegrep
 
-> — What’s zeegrep for?  
-> — Protection.  
+> — What’s zeegrep for?
+> — Protection.
 > — Protection from what, ze sed commands?
 
 Fast search and replace from your terminal. Like ripgrep, but actually replaces things. Use at your own risk.
