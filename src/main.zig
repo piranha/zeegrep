@@ -95,15 +95,25 @@ pub fn main() !void {
     }
     const pattern = rest[0];
 
-    // Allow a limited form of "options after pattern" by parsing once more on
-    // the args after the pattern (until the first path positional).
-    const paths = opt.parse(Options, &options, rest[1..]) catch |e| switch (e) {
+    // Parse options from remaining args (options can appear anywhere, mixed with paths)
+    const remaining = opt.parse(Options, &options, rest[1..]) catch |e| switch (e) {
         error.Help => {
             opt.usage(Options);
             return;
         },
         else => return e,
     };
+
+    // Filter out parsed options from remaining args to get actual paths
+    var path_buf: [64][]const u8 = undefined;
+    var n_paths: usize = 0;
+    for (remaining) |arg| {
+        if (arg.len > 0 and arg[0] != '-') {
+            path_buf[n_paths] = arg;
+            n_paths += 1;
+        }
+    }
+    const paths = path_buf[0..n_paths];
 
     const stdout = std.fs.File.stdout().deprecatedWriter();
     run.run(allocator, stdout, options, pattern, paths) catch |e| switch (e) {

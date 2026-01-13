@@ -63,6 +63,7 @@ fn parseInternal(
 
     var i: usize = 0;
     var found_subcmd = false;
+    var first_pos: usize = args.len;
 
     while (i < args.len) : (i += 1) {
         const arg = args[i];
@@ -139,10 +140,11 @@ fn parseInternal(
             found_subcmd = true;
             continue;
         }
-        return args[i..];
+        if (first_pos == args.len) first_pos = i;
+        // Continue parsing to handle trailing options after positionals
     }
 
-    return args[args.len..];
+    return args[first_pos..];
 }
 
 fn normalizeName(name: []const u8, buf: []u8) []const u8 {
@@ -721,4 +723,25 @@ test "repeatable option appends (fixed-capacity list)" {
     try std.testing.expectEqual(@as(usize, 2), got.len);
     try std.testing.expectEqualStrings("log", got[0]);
     try std.testing.expectEqualStrings("pyc", got[1]);
+}
+
+test "trailing options after positionals" {
+    const Opts = struct {
+        verbose: bool = false,
+        count: bool = false,
+
+        pub const meta = .{
+            .verbose = .{ .short = 'v' },
+            .count = .{},
+        };
+    };
+
+    var opts = Opts{};
+    const rest = try parse(Opts, &opts, &.{ "path1", "--count", "path2", "-v" });
+
+    try std.testing.expect(opts.verbose);
+    try std.testing.expect(opts.count);
+    // Returned slice includes positionals starting from first one
+    try std.testing.expectEqual(@as(usize, 4), rest.len);
+    try std.testing.expectEqualStrings("path1", rest[0]);
 }
