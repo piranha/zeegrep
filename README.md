@@ -14,7 +14,7 @@ ripgrep is amazing at searching. But when you need to replace, you're back to pi
 
 Also, I'm just impatient and waiting for an LLM to do replacements one by one... who's got time for this?
 
-## Download
+## Installation
 
 ```bash
 curl -fsSL https://github.com/piranha/zeegrep/releases/latest/download/zg-$(uname -s)-$(uname -m) \

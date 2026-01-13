@@ -107,6 +107,7 @@ fn parseInternal(
                 }
                 continue;
             }
+            std.debug.print("error: unknown option '--{s}'\n", .{name});
             return ParseError.UnknownOption;
         }
 
@@ -131,6 +132,7 @@ fn parseInternal(
                 }
                 continue;
             }
+            std.debug.print("error: unknown option '-{c}'\n", .{short});
             return ParseError.UnknownOption;
         }
 
@@ -402,6 +404,7 @@ pub fn printUsage(comptime T: type, writer: anytype) void {
     }
 
     writer.writeAll("  -h, --help                  Show this help\n") catch return;
+    writer.writeAll("  -V, --version               Show version\n") catch return;
 }
 
 fn typeName(comptime T: type) [:0]const u8 {

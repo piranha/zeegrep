@@ -23,12 +23,7 @@ jobs:
 
       - name: Build all targets
         run: |
-          V=${{ github.ref_name }}
-          zig build --release=fast -Dversion=$V -Dtarget=x86_64-linux-musl -Doutput=dist/zg-Linux-x86_64
-          zig build --release=fast -Dversion=$V -Dtarget=aarch64-linux-musl -Doutput=dist/zg-Linux-aarch64
-          zig build --release=fast -Dversion=$V -Dtarget=x86_64-macos -Doutput=dist/zg-Darwin-x86_64
-          zig build --release=fast -Dversion=$V -Dtarget=aarch64-macos -Doutput=dist/zg-Darwin-arm64
-          zig build --release=fast -Dversion=$V -Dtarget=x86_64-windows -Doutput=dist/zg-Windows-x86_64.exe
+          make ciall VERSION=${{ github.ref_name }}
 
       - name: Create release
         uses: softprops/action-gh-release@v2
