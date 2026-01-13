@@ -1,9 +1,10 @@
 const std = @import("std");
 const pcre2 = @import("pcre2.zig");
 const ansi = @import("core/ansi.zig");
+const bmh = @import("core/bmh.zig");
 
 pub const Pattern = union(enum) {
-    literal: []const u8,
+    literal: bmh.Matcher,
     regex: pcre2.Code,
 
     pub fn deinit(self: *Pattern) void {
@@ -11,25 +12,27 @@ pub const Pattern = union(enum) {
             .literal => {},
             .regex => |*c| c.deinit(),
         }
-        self.* = .{ .literal = "" };
+        self.* = .{ .literal = bmh.Matcher.init("", false) };
     }
 };
 
 pub fn compile(allocator: std.mem.Allocator, pat: []const u8, ignore_case: bool) !Pattern {
     if (isRegex(pat)) return .{ .regex = try pcre2.compile(allocator, pat, ignore_case) };
-    return .{ .literal = pat };
+    return .{ .literal = bmh.Matcher.init(pat, ignore_case) };
 }
 
 pub fn matchAny(pat: *const Pattern, hay: []const u8, ignore_case: bool) bool {
+    _ = ignore_case; // baked into pattern at compile time
     switch (pat.*) {
-        .literal => |needle| return contains(hay, needle, ignore_case),
+        .literal => |*m| return m.contains(hay),
         .regex => |*code| return pcre2.matchAny(code, hay),
     }
 }
 
 pub fn countMatches(pat: *const Pattern, hay: []const u8, ignore_case: bool) usize {
+    _ = ignore_case;
     switch (pat.*) {
-        .literal => |needle| return countSubstr(hay, needle, ignore_case),
+        .literal => |*m| return m.count(hay),
         .regex => |*code| return pcre2.countMatches(code, hay),
     }
 }
@@ -40,9 +43,10 @@ pub const Replace = struct {
 };
 
 pub fn replaceAll(allocator: std.mem.Allocator, pat: *const Pattern, hay: []const u8, repl: []const u8, ignore_case: bool) !Replace {
+    _ = ignore_case;
     switch (pat.*) {
-        .literal => |needle| {
-            const rr = try replaceLiteral(allocator, hay, needle, repl, ignore_case);
+        .literal => |*m| {
+            const rr = try replaceLiteral(allocator, hay, m, repl);
             return .{ .out = rr.out, .n = rr.n };
         },
         .regex => |*code| {
@@ -53,8 +57,9 @@ pub fn replaceAll(allocator: std.mem.Allocator, pat: *const Pattern, hay: []cons
 }
 
 pub fn writeHighlighted(on: bool, pat: *const Pattern, writer: anytype, hay: []const u8, ignore_case: bool) !void {
+    _ = ignore_case;
     switch (pat.*) {
-        .literal => |needle| try writeHighlightedLiteral(on, writer, hay, needle, ignore_case),
+        .literal => |*m| try writeHighlightedLiteral(on, writer, hay, m),
         .regex => |*code| try pcre2.writeHighlighted(on, code, writer, hay),
     }
 }
@@ -67,35 +72,9 @@ fn isRegex(pat: []const u8) bool {
     return false;
 }
 
-fn contains(hay: []const u8, needle: []const u8, ignore_case: bool) bool {
-    if (!ignore_case) return std.mem.indexOf(u8, hay, needle) != null;
-    if (needle.len == 0) return true;
-    if (needle.len > hay.len) return false;
-    var i: usize = 0;
-    while (i + needle.len <= hay.len) : (i += 1) {
-        if (eqAsciiFold(hay[i .. i + needle.len], needle)) return true;
-    }
-    return false;
-}
-
-fn countSubstr(hay: []const u8, needle: []const u8, ignore_case: bool) usize {
-    if (needle.len == 0) return 0;
-    var off: usize = 0;
-    var n: usize = 0;
-    while (off + needle.len <= hay.len) {
-        const idx = if (!ignore_case)
-            std.mem.indexOfPos(u8, hay, off, needle)
-        else
-            indexOfPosAsciiFold(hay, off, needle);
-        if (idx == null) break;
-        n += 1;
-        off = idx.? + needle.len;
-    }
-    return n;
-}
-
-fn replaceLiteral(allocator: std.mem.Allocator, hay: []const u8, needle: []const u8, repl: []const u8, ignore_case: bool) !Replace {
-    if (needle.len == 0) return .{ .out = try allocator.dupe(u8, hay), .n = 0 };
+fn replaceLiteral(allocator: std.mem.Allocator, hay: []const u8, m: *const bmh.Matcher, repl: []const u8) !Replace {
+    const needle_len = m.needle.len;
+    if (needle_len == 0) return .{ .out = try allocator.dupe(u8, hay), .n = 0 };
 
     var out: std.ArrayListUnmanaged(u8) = .{};
     errdefer out.deinit(allocator);
@@ -103,52 +82,25 @@ fn replaceLiteral(allocator: std.mem.Allocator, hay: []const u8, needle: []const
     var off: usize = 0;
     var n: usize = 0;
     while (off <= hay.len) {
-        const idx = if (!ignore_case)
-            std.mem.indexOfPos(u8, hay, off, needle)
-        else
-            indexOfPosAsciiFold(hay, off, needle);
-        if (idx == null) break;
-        const i = idx.?;
-        try out.appendSlice(allocator, hay[off..i]);
+        const idx = m.indexOfPos(hay, off) orelse break;
+        try out.appendSlice(allocator, hay[off..idx]);
         try out.appendSlice(allocator, repl);
         n += 1;
-        off = i + needle.len;
+        off = idx + needle_len;
     }
     try out.appendSlice(allocator, hay[off..]);
     return .{ .out = try out.toOwnedSlice(allocator), .n = n };
 }
 
-fn indexOfPosAsciiFold(hay: []const u8, start: usize, needle: []const u8) ?usize {
-    if (needle.len == 0) return start;
-    if (needle.len > hay.len) return null;
-    var i: usize = start;
-    while (i + needle.len <= hay.len) : (i += 1) {
-        if (eqAsciiFold(hay[i .. i + needle.len], needle)) return i;
-    }
-    return null;
-}
-
-fn eqAsciiFold(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |x, y| {
-        if (std.ascii.toLower(x) != std.ascii.toLower(y)) return false;
-    }
-    return true;
-}
-
-fn writeHighlightedLiteral(on: bool, writer: anytype, hay: []const u8, needle: []const u8, ignore_case: bool) !void {
-    if (needle.len == 0) return writer.writeAll(hay);
+fn writeHighlightedLiteral(on: bool, writer: anytype, hay: []const u8, m: *const bmh.Matcher) !void {
+    const needle_len = m.needle.len;
+    if (needle_len == 0) return writer.writeAll(hay);
     var off: usize = 0;
-    while (off + needle.len <= hay.len) {
-        const idx = if (!ignore_case)
-            std.mem.indexOfPos(u8, hay, off, needle)
-        else
-            indexOfPosAsciiFold(hay, off, needle);
-        if (idx == null) break;
-        const i = idx.?;
-        try writer.writeAll(hay[off..i]);
-        try ansi.styled(on, .match, hay[i .. i + needle.len]).format(writer);
-        off = i + needle.len;
+    while (true) {
+        const idx = m.indexOfPos(hay, off) orelse break;
+        try writer.writeAll(hay[off..idx]);
+        try ansi.styled(on, .match, hay[idx .. idx + needle_len]).format(writer);
+        off = idx + needle_len;
     }
     try writer.writeAll(hay[off..]);
 }
