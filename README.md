@@ -21,9 +21,10 @@ curl -fsSL https://github.com/piranha/zeegrep/releases/latest/download/zg-$(unam
   -o ~/.local/bin/zg && chmod +x ~/.local/bin/zg
 ```
 
-macOS users: if you get a quarantine warning, run `xattr -d com.apple.quarantine ~/.local/bin/zg`
-
 Or grab a binary from [releases](https://github.com/piranha/zeegrep/releases).
+
+> [!NOTE]
+> macOS users: if you get a quarantine warning, run `xattr -d com.apple.quarantine ~/.local/bin/zg`
 
 ## Claude Code
 

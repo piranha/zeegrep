@@ -31,7 +31,7 @@ pub fn build(b: *std.Build) void {
         const install = b.addInstallFileWithDir(exe.getEmittedBin(), .prefix, out_path);
         b.getInstallStep().dependOn(&install.step);
     } else {
-    b.installArtifact(exe);
+        b.installArtifact(exe);
     }
 
     const run_cmd = b.addRunArtifact(exe);
