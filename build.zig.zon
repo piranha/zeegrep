@@ -1,0 +1,7 @@
+.{
+    .name = .zeegrep,
+    .version = "0.15.2",
+    .dependencies = .{},
+    .paths = .{""},
+    .fingerprint = 0x6594ab950c0a50d4,
+}

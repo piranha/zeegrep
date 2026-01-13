@@ -1,11 +1,19 @@
 const std = @import("std");
 const opt = @import("core/opt.zig");
+const run = @import("run.zig");
 
 const Options = struct {
     replace: ?[]const u8 = null,
     dry_run: bool = false,
     ignore_case: bool = false,
     context: u32 = 0,
+    after: u32 = 0,
+    before: u32 = 0,
+    quiet: bool = false,
+    count: bool = false,
+    abs: bool = false,
+    sort: bool = false,
+    file_names: bool = false,
     include: opt.Multi([]const u8, 64) = .{},
     exclude: opt.Multi([]const u8, 64) = .{},
 
@@ -14,11 +22,18 @@ const Options = struct {
         .dry_run = .{ .short = 'n', .help = "Dry-run (show diff, no writes)" },
         .ignore_case = .{ .short = 'i', .help = "Case-insensitive search" },
         .context = .{ .short = 'C', .help = "Context lines" },
+        .after = .{ .short = 'A', .help = "Context lines after match" },
+        .before = .{ .short = 'B', .help = "Context lines before match" },
+        .quiet = .{ .short = 'q', .help = "Quiet (exit code only)" },
+        .count = .{ .help = "Only print match count" },
+        .abs = .{ .help = "Print absolute paths" },
+        .sort = .{ .help = "Sort output by path" },
+        .file_names = .{ .short = 'f', .help = "Match against file names (not contents)" },
         .include = .{ .short = 'g', .help = "Only paths containing substring (repeatable)" },
         .exclude = .{ .short = 'x', .help = "Skip paths containing substring (repeatable)" },
     };
 
-    pub const about = .{ .name = "zg", .desc = "zeegrep (WIP)" };
+    pub const about = .{ .name = "zeegrep", .desc = "zee search & replace tool" };
 };
 
 pub fn main() !void {
@@ -60,16 +75,9 @@ pub fn main() !void {
         else => return e,
     };
 
-    var stdout = std.fs.File.stdout().deprecatedWriter();
-    try stdout.print("pattern: {s}\n", .{pattern});
-    try printList(stdout, "exclude", options.exclude.constSlice());
-    try printList(stdout, "include", options.include.constSlice());
-    try printList(stdout, "paths", paths);
-}
-
-fn printList(writer: anytype, label: []const u8, items: []const []const u8) !void {
-    if (items.len == 0) return;
-    try writer.print("{s}:", .{label});
-    for (items) |it| try writer.print(" {s}", .{it});
-    try writer.writeByte('\n');
+    const stdout = std.fs.File.stdout().deprecatedWriter();
+    run.run(allocator, stdout, options, pattern, paths) catch |e| switch (e) {
+        error.NoMatches => std.process.exit(1),
+        else => std.process.exit(2),
+    };
 }

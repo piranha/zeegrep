@@ -20,6 +20,13 @@ zig build --release=fast
 cp zig-out/bin/zg ~/.local/bin/
 ```
 
+Or:
+
+```bash
+make release
+cp zig-out/bin/zg ~/.local/bin/
+```
+
 ## Usage
 
 ```bash
@@ -84,7 +91,7 @@ zeegrep reads `.gitignore` and `.ignore` files. Binaries are skipped automatical
 
 ## Speed
 
-Fast enough. Uses Boyer-Moore for literal patterns, compiles regexes once, parallelizes file search.
+Fast enough. Uses PCRE2 (JIT when possible), compiles regexes once, parallelizes file search.
 
 Will it beat ripgrep? No. Andrew Gallant has mass and reach, we don’t compete.
 

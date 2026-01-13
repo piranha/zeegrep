@@ -8,10 +8,16 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = optimize != .Debug,
     });
     const exe = b.addExecutable(.{
         .name = "zg",
         .root_module = exe_module,
+    });
+    exe.root_module.linkSystemLibrary("libpcre2-8", .{
+        .use_pkg_config = .force,
+        .preferred_link_mode = .static,
+        .search_strategy = .mode_first,
     });
     b.installArtifact(exe);
 
@@ -30,6 +36,20 @@ pub fn build(b: *std.Build) void {
     const opt_tests = b.addTest(.{ .root_module = opt_test_module });
     const run_opt_tests = b.addRunArtifact(opt_tests);
 
+    const run_test_module = b.createModule(.{
+        .root_source_file = b.path("src/run.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const run_tests = b.addTest(.{ .root_module = run_test_module });
+    run_tests.root_module.linkSystemLibrary("libpcre2-8", .{
+        .use_pkg_config = .force,
+        .preferred_link_mode = .static,
+        .search_strategy = .mode_first,
+    });
+    const run_run_tests = b.addRunArtifact(run_tests);
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_opt_tests.step);
+    test_step.dependOn(&run_run_tests.step);
 }

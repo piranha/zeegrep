@@ -326,7 +326,7 @@ pub fn printUsage(comptime T: type, writer: anytype) void {
 
     // Header
     if (has_about) {
-        writer.print("zeegrep {s}", .{T.about.name}) catch return;
+        writer.print("{s}", .{T.about.name}) catch return;
         if (@hasField(@TypeOf(T.about), "desc")) {
             writer.print(" - {s}", .{T.about.desc}) catch return;
         }
@@ -435,7 +435,7 @@ pub fn printMergedUsage(comptime G: type, comptime S: type, writer: anytype) voi
 
     // Header from subcommand
     if (has_about) {
-        writer.print("zeegrep {s}", .{S.about.name}) catch return;
+        writer.print("{s}", .{S.about.name}) catch return;
         if (@hasField(@TypeOf(S.about), "desc")) {
             writer.print(" - {s}", .{S.about.desc}) catch return;
         }
@@ -599,7 +599,7 @@ test "printUsage output" {
     printUsage(Opts, fbs.writer());
     const output = fbs.getWritten();
 
-    try std.testing.expect(std.mem.indexOf(u8, output, "zeegrep zg - Fast search and replace") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "zg - Fast search and replace") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "-r, --replace") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "(default: 2)") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "--dry-run") != null);
