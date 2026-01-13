@@ -8,7 +8,7 @@ Fast search and replace from your terminal. Like ripgrep, but actually replaces 
 
 ## Why
 
-Because `rg pattern | xargs sed -i 's/pattern/replacement/g'` is not a workflow, it’s a cry for help.
+Because `rg pattern --files | xargs sed -i 's/pattern/replacement/g'` is not a workflow, it’s a cry for help.
 
 ripgrep is amazing at searching. But when you need to replace, you’re back to piping, sed, and prayer. zeegrep does both in one tool with one syntax.
 
@@ -67,19 +67,16 @@ Preview before replacing:
 
 ```bash
 $ zg oldFunc -r newFunc -n
-
-=== src/api.clj:42
+── src/api.clj:42 ──
 - (defn oldFunc [x]
 + (defn newFunc [x]
 
-=== src/core.clj:17
+── src/core.clj:17 ──
 -   (oldFunc response)
 +   (newFunc response)
 
 2 files, 3 replacements
 ```
-
-Standard unified diff format. Pipe to `patch` if you’re feeling adventurous.
 
 ## Respects Your Ignores
 
@@ -91,7 +88,7 @@ Fast enough. Uses Boyer-Moore for literal patterns, compiles regexes once, paral
 
 Will it beat ripgrep? No. Andrew Gallant has mass and reach, we don’t compete.
 
-But it’s fast enough that you won’t notice, and it actually does the thing you needed.
+But it’s fast enough that you won’t notice, and it's convenient.
 
 ## See Also
 
