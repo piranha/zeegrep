@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const engine = @import("engine.zig");
 const diff = @import("diff.zig");
 const core_pool = @import("core/pool.zig");
@@ -25,7 +26,7 @@ pub fn run(allocator: std.mem.Allocator, writer: anytype, options: anytype, patt
     try pool.init(allocator, null);
     defer pool.deinit();
 
-    const is_tty = std.posix.isatty(std.posix.STDOUT_FILENO);
+    const is_tty = std.fs.File.stdout().isTty();
     const no_color = std.process.getEnvVarOwned(allocator, "NO_COLOR") catch null;
     defer if (no_color) |v| allocator.free(v);
     const use_color = ansi.enabled(options.color, is_tty, no_color != null);
@@ -193,15 +194,9 @@ fn Job(comptime Opts: type) type {
             const stat = f.stat() catch return;
             if (stat.size == 0 or stat.size > 64 * 1024 * 1024) return;
 
-            const data = std.posix.mmap(
-                null,
-                stat.size,
-                std.c.PROT.READ,
-                .{ .TYPE = .PRIVATE },
-                f.handle,
-                0,
-            ) catch return;
-            defer std.posix.munmap(data);
+            const file_data = mapFile(shared.allocator, f, stat.size) catch return;
+            defer unmapFile(shared.allocator, file_data);
+            const data = file_data.ptr;
 
             if (isBinary(data)) return;
 
@@ -347,6 +342,29 @@ fn splitLines(allocator: std.mem.Allocator, data: []const u8) ![]const []const u
 fn isBinary(data: []const u8) bool {
     const n = @min(data.len, 4096);
     return std.mem.indexOfScalar(u8, data[0..n], 0) != null;
+}
+
+const FileData = struct {
+    ptr: []const u8,
+};
+
+fn mapFile(allocator: std.mem.Allocator, f: std.fs.File, size: u64) !FileData {
+    if (comptime builtin.os.tag == .windows) {
+        const buf = try allocator.alloc(u8, size);
+        const n = try f.readAll(buf);
+        return .{ .ptr = buf[0..n] };
+    } else {
+        const data = try std.posix.mmap(null, size, std.c.PROT.READ, .{ .TYPE = .PRIVATE }, f.handle, 0);
+        return .{ .ptr = data };
+    }
+}
+
+fn unmapFile(allocator: std.mem.Allocator, fd: FileData) void {
+    if (comptime builtin.os.tag == .windows) {
+        allocator.free(fd.ptr);
+    } else {
+        std.posix.munmap(@alignCast(@constCast(fd.ptr)));
+    }
 }
 
 fn writeAtomic(allocator: std.mem.Allocator, path: []const u8, data: []const u8) !void {

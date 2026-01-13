@@ -416,7 +416,7 @@ pub fn usage(comptime T: type) void {
     var buf: [4096]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
     printUsage(T, fbs.writer());
-    _ = std.posix.write(std.posix.STDERR_FILENO, fbs.getWritten()) catch {};
+    std.fs.File.stderr().writeAll(fbs.getWritten()) catch {};
 }
 
 /// Find subcommand name (first positional arg)
@@ -516,7 +516,7 @@ pub fn mergedUsage(comptime G: type, comptime S: type) void {
     var buf: [4096]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
     printMergedUsage(G, S, fbs.writer());
-    _ = std.posix.write(std.posix.STDERR_FILENO, fbs.getWritten()) catch {};
+    std.fs.File.stderr().writeAll(fbs.getWritten()) catch {};
 }
 
 // ============ Tests ============
