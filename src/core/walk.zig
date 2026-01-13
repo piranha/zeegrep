@@ -49,7 +49,7 @@ fn collectRoot(
             }
             try collectDir(allocator, cwd, ign, list, prefix, d, include, exclude);
         } else {
-            if (!passes(root, include, exclude)) return;
+            if (!passesFile(root, include, exclude)) return;
             if (ign.ignored(root, false)) return;
             try list.append(allocator, try allocator.dupe(u8, root));
         }
@@ -73,7 +73,11 @@ fn collectDir(
             try std.fs.path.join(allocator, &.{ prefix, ent.name });
         defer allocator.free(rel);
 
-        if (!passes(rel, include, exclude)) continue;
+        if (ent.kind == .directory) {
+            if (excluded(rel, exclude)) continue;
+        } else {
+            if (!passesFile(rel, include, exclude)) continue;
+        }
         if (ign.ignored(rel, ent.kind == .directory)) continue;
 
         switch (ent.kind) {
@@ -90,17 +94,22 @@ fn collectDir(
     }
 }
 
-fn passes(path: []const u8, include: []const []const u8, exclude: []const []const u8) bool {
-    for (exclude) |x| {
-        if (glob.isGlob(x)) {
-            if (glob.matchPath(x, path)) return false;
-        } else if (std.mem.indexOf(u8, path, x) != null) return false;
-    }
+fn passesFile(path: []const u8, include: []const []const u8, exclude: []const []const u8) bool {
+    if (excluded(path, exclude)) return false;
     if (include.len == 0) return true;
     for (include) |g| {
         if (glob.isGlob(g)) {
             if (glob.matchPath(g, path)) return true;
         } else if (std.mem.indexOf(u8, path, g) != null) return true;
+    }
+    return false;
+}
+
+fn excluded(path: []const u8, exclude: []const []const u8) bool {
+    for (exclude) |x| {
+        if (glob.isGlob(x)) {
+            if (glob.matchPath(x, path)) return true;
+        } else if (std.mem.indexOf(u8, path, x) != null) return true;
     }
     return false;
 }
@@ -126,4 +135,25 @@ test "collect files with include/exclude" {
     }
     try std.testing.expectEqual(@as(usize, 1), got.len);
     try std.testing.expect(std.mem.endsWith(u8, got[0], "src/a.clj"));
+}
+
+test "include does not prune directories" {
+    var td = std.testing.tmpDir(.{});
+    defer td.cleanup();
+
+    try td.dir.makeDir("src");
+    try td.dir.writeFile(.{ .sub_path = "src/run.zig", .data = "x\n" });
+
+    var ign = ignore.Stack.init(std.testing.allocator);
+    defer ign.deinit();
+    try ign.pushDir(td.dir, "");
+    defer ign.popDir();
+
+    const got = try collectFiles(std.testing.allocator, td.dir, &ign, &.{ "." }, &.{ "run" }, &.{});
+    defer {
+        for (got) |p| std.testing.allocator.free(p);
+        std.testing.allocator.free(got);
+    }
+    try std.testing.expectEqual(@as(usize, 1), got.len);
+    try std.testing.expect(std.mem.endsWith(u8, got[0], "src/run.zig"));
 }

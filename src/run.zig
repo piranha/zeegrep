@@ -55,7 +55,7 @@ pub fn run(allocator: std.mem.Allocator, writer: anytype, options: anytype, patt
     const no_color = std.process.getEnvVarOwned(allocator, "NO_COLOR") catch null;
     defer if (no_color) |v| allocator.free(v);
     const use_color = ansi.enabled(options.color, is_tty, no_color != null);
-    const use_heading = options.replace == null and !options.quiet and !options.count and !options.file_names and files.len > 1;
+    const use_heading = options.replace == null and !options.quiet and !options.count and !options.file_names and isMultiPathSearch(cwd, paths);
 
     var shared = Shared.init(ta, before, after, use_color, use_heading);
     defer shared.deinit();
@@ -147,14 +147,14 @@ fn Job(comptime Opts: type) type {
 
         fn work(shared: *Shared, path: []const u8, options: Opts, pat: *const engine.Pattern) !void {
             if (options.file_names) {
-                const base = std.fs.path.basename(path);
-                if (!engine.matchAny(pat, base, options.ignore_case)) return;
-                shared.add(1, 0, false);
+                if (!engine.matchAny(pat, path, options.ignore_case)) return;
+                const n = engine.countMatches(pat, path, options.ignore_case);
+                shared.add(n, 0, false);
                 if (options.count and !options.quiet) {
                     var buf: std.ArrayListUnmanaged(u8) = .{};
                     defer buf.deinit(shared.allocator);
                     const w = buf.writer(shared.allocator);
-                    try w.print("{f}:{f}\n", .{ ansi.styled(shared.color, .path, path), ansi.styled(shared.color, .line_no, @as(usize, 1)) });
+                    try w.print("{f}:{f}\n", .{ ansi.styled(shared.color, .path, path), ansi.styled(shared.color, .line_no, n) });
                     shared.push(.{ .path = path, .out = try buf.toOwnedSlice(shared.allocator) });
                     return;
                 }
@@ -352,4 +352,21 @@ test "search and replace tmpdir" {
     out = fbs.getWritten();
     try std.testing.expect(std.mem.indexOf(u8, out, "a.txt:2") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "b.txt") == null);
+
+    // -f (path match)
+    fbs.reset();
+    o.count = false;
+    o.file_names = true;
+    _ = run(std.testing.allocator, fbs.writer(), o, "a.txt", &.{root}) catch {};
+    out = fbs.getWritten();
+    try std.testing.expect(std.mem.indexOf(u8, out, "a.txt") != null);
+}
+
+fn isMultiPathSearch(cwd: std.fs.Dir, paths: []const []const u8) bool {
+    if (paths.len == 0) return true;
+    for (paths) |p| {
+        const st = cwd.statFile(p) catch continue;
+        if (st.kind == .directory) return true;
+    }
+    return false;
 }
