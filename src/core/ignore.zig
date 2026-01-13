@@ -1,4 +1,5 @@
 const std = @import("std");
+const glob = @import("glob.zig");
 
 pub const Stack = struct {
     allocator: std.mem.Allocator,
@@ -135,67 +136,9 @@ const Rule = struct {
 fn matchPat(pat: []const u8, target: []const u8, full_path: bool) bool {
     if (!full_path and std.mem.indexOfScalar(u8, pat, std.fs.path.sep) == null) {
         const base = std.fs.path.basename(target);
-        return globMatch(pat, base);
+        return glob.match(pat, base);
     }
-    return globMatch(pat, target);
-}
-
-fn globMatch(pat: []const u8, s: []const u8) bool {
-    var pi: usize = 0;
-    var si: usize = 0;
-    var star_pi: ?usize = null;
-    var star_si: usize = 0;
-    var star_slash: bool = false;
-
-    while (si < s.len) {
-        if (pi < pat.len and pat[pi] == '\\' and pi + 1 < pat.len) {
-            if (pat[pi + 1] == s[si]) {
-                pi += 2;
-                si += 1;
-                continue;
-            }
-        }
-
-        if (pi < pat.len and pat[pi] == '?' and s[si] != std.fs.path.sep) {
-            pi += 1;
-            si += 1;
-            continue;
-        }
-
-        if (pi < pat.len and pat[pi] == '*') {
-            star_slash = pi + 1 < pat.len and pat[pi + 1] == '*';
-            star_pi = if (star_slash) pi + 2 else pi + 1;
-            pi = star_pi.?;
-            star_si = si;
-            continue;
-        }
-
-        if (pi < pat.len and pat[pi] == s[si]) {
-            pi += 1;
-            si += 1;
-            continue;
-        }
-
-        if (star_pi) |spi| {
-            if (!star_slash and s[star_si] == std.fs.path.sep) return false;
-            star_si += 1;
-            si = star_si;
-            pi = spi;
-            continue;
-        }
-        return false;
-    }
-
-    while (pi < pat.len) {
-        if (pat[pi] == '*') {
-            pi += 1;
-            if (pi < pat.len and pat[pi] == '*') pi += 1;
-            continue;
-        }
-        if (pat[pi] == '\\' and pi + 1 < pat.len) return false;
-        break;
-    }
-    return pi == pat.len;
+    return glob.match(pat, target);
 }
 
 fn defaultSkip(rel_path: []const u8) bool {
