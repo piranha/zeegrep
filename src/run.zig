@@ -12,8 +12,10 @@ pub fn run(allocator: std.mem.Allocator, writer: anytype, options: anytype, patt
 
     if (options.file_names and options.replace != null) return error.InvalidArgs;
 
-    var ign = try core_ignore.Ignorer.init(allocator, cwd);
+    var ign = core_ignore.Stack.init(allocator);
     defer ign.deinit();
+    try ign.pushDir(cwd, "");
+    defer ign.popDir();
 
     var files: [][]const u8 = try core_walk.collectFiles(
         allocator,

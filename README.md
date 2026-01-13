@@ -1,6 +1,6 @@
 # zeegrep
 
-> — What’s zeegrep for?
+> — What's zeegrep for?
 > — Protection.
 > — Protection from what, ze sed commands?
 
@@ -8,9 +8,13 @@ Fast search and replace from your terminal. Like ripgrep, but actually replaces 
 
 ## Why
 
-Because `rg pattern --files | xargs sed -i 's/pattern/replacement/g'` is not a workflow, it’s a cry for help.
+Because `rg pattern --files | xargs sed -i 's/pattern/replacement/g'` is not a workflow, it's a cry for help.
 
-ripgrep is amazing at searching. But when you need to replace, you’re back to piping, sed, and prayer. zeegrep does both in one tool with one syntax.
+ripgrep is amazing at searching. But when you need to replace, you're back to piping, sed, and prayer. zeegrep does both in one tool with one syntax.
+
+Also, I'm just impatient and waiting for an LLM to do replacements one by one... who's got time for this?
+
+## Download
 
 ## Compile
 
@@ -94,9 +98,9 @@ zeegrep reads `.gitignore` and `.ignore` files. Binaries are skipped automatical
 
 Fast enough. Uses PCRE2 (JIT when possible), compiles regexes once, parallelizes file search.
 
-Will it beat ripgrep? No. Andrew Gallant has mass and reach, we don’t compete.
+Will it beat ripgrep? No, it doesn't compete with ripgrep on performance, it competes with an LLM round-trip. Though... that Aho-Corasick algorithm is sick!
 
-But it’s fast enough that you won’t notice, and it's convenient.
+But it's fast enough that you won't notice, and it's convenient.
 
 ## See Also
 

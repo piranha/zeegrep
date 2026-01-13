@@ -4,7 +4,7 @@ const ignore = @import("ignore.zig");
 pub fn collectFiles(
     allocator: std.mem.Allocator,
     cwd: std.fs.Dir,
-    ign: *const ignore.Ignorer,
+    ign: *ignore.Stack,
     paths: []const []const u8,
     include: []const []const u8,
     exclude: []const []const u8,
@@ -27,7 +27,7 @@ pub fn collectFiles(
 fn collectRoot(
     allocator: std.mem.Allocator,
     cwd: std.fs.Dir,
-    ign: *const ignore.Ignorer,
+    ign: *ignore.Stack,
     list: *std.ArrayListUnmanaged([]const u8),
     root: []const u8,
     include: []const []const u8,
@@ -42,10 +42,14 @@ fn collectRoot(
             const prefix = if (std.mem.eql(u8, root, ".") or std.mem.eql(u8, root, "./")) "" else root;
             var d = try cwd.openDir(root, .{ .iterate = true });
             defer d.close();
+            if (prefix.len != 0) {
+                try ign.pushDir(d, prefix);
+                defer ign.popDir();
+            }
             try collectDir(allocator, cwd, ign, list, prefix, d, include, exclude);
         } else {
             if (!passes(root, include, exclude)) return;
-            if (ign.match(root, false)) return;
+            if (ign.ignored(root, false)) return;
             try list.append(allocator, try allocator.dupe(u8, root));
         }
 }
@@ -53,7 +57,7 @@ fn collectRoot(
 fn collectDir(
     allocator: std.mem.Allocator,
     cwd: std.fs.Dir,
-    ign: *const ignore.Ignorer,
+    ign: *ignore.Stack,
     list: *std.ArrayListUnmanaged([]const u8),
     prefix: []const u8,
     dir: std.fs.Dir,
@@ -69,13 +73,15 @@ fn collectDir(
         defer allocator.free(rel);
 
         if (!passes(rel, include, exclude)) continue;
-        if (ign.match(rel, ent.kind == .directory)) continue;
+        if (ign.ignored(rel, ent.kind == .directory)) continue;
 
         switch (ent.kind) {
             .file => try list.append(allocator, try allocator.dupe(u8, rel)),
             .directory => {
                 var sub = try cwd.openDir(rel, .{ .iterate = true });
                 defer sub.close();
+                try ign.pushDir(sub, rel);
+                defer ign.popDir();
                 try collectDir(allocator, cwd, ign, list, rel, sub, include, exclude);
             },
             else => {},
@@ -99,8 +105,10 @@ test "collect files with include/exclude" {
     try td.dir.writeFile(.{ .sub_path = "src/a.clj", .data = "x\n" });
     try td.dir.writeFile(.{ .sub_path = "test/b.clj", .data = "x\n" });
 
-    var ign = try ignore.Ignorer.init(std.testing.allocator, td.dir);
+    var ign = ignore.Stack.init(std.testing.allocator);
     defer ign.deinit();
+    try ign.pushDir(td.dir, "");
+    defer ign.popDir();
 
     const got = try collectFiles(std.testing.allocator, td.dir, &ign, &.{ "." }, &.{ "src" }, &.{ "test" });
     defer {

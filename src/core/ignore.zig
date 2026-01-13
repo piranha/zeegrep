@@ -1,34 +1,62 @@
 const std = @import("std");
 
-pub const Ignorer = struct {
+pub const Stack = struct {
     allocator: std.mem.Allocator,
-    pats: std.ArrayListUnmanaged(Pat) = .{},
+    frames: std.ArrayListUnmanaged(Frame) = .{},
+    rules: std.ArrayListUnmanaged(Rule) = .{},
 
-    pub fn init(allocator: std.mem.Allocator, dir: std.fs.Dir) !Ignorer {
-        var self: Ignorer = .{ .allocator = allocator };
-        errdefer self.deinit();
-        try self.load(dir, ".gitignore");
-        try self.load(dir, ".ignore");
-        return self;
+    pub fn init(allocator: std.mem.Allocator) Stack {
+        return .{ .allocator = allocator };
     }
 
-    pub fn deinit(self: *Ignorer) void {
-        for (self.pats.items) |p| self.allocator.free(p.s);
-        self.pats.deinit(self.allocator);
+    pub fn deinit(self: *Stack) void {
+        while (self.frames.items.len > 0) self.popDir();
+        self.frames.deinit(self.allocator);
+        self.rules.deinit(self.allocator);
         self.* = undefined;
     }
 
-    pub fn match(self: *const Ignorer, rel_path: []const u8, is_dir: bool) bool {
-        if (defaultSkip(rel_path)) return true;
-        var ignored = false;
-        for (self.pats.items) |p| {
-            if (!p.matches(rel_path, is_dir)) continue;
-            ignored = !p.neg;
+    pub fn pushDir(self: *Stack, dir: std.fs.Dir, base_rel: []const u8) !void {
+        const base = try self.allocator.dupe(u8, base_rel);
+        errdefer self.allocator.free(base);
+
+        const frame: Frame = .{ .base = base, .rules_start = self.rules.items.len };
+        try self.frames.append(self.allocator, frame);
+        errdefer {
+            _ = self.frames.pop();
+            self.allocator.free(base);
         }
-        return ignored;
+
+        try self.load(dir, ".gitignore");
+        try self.load(dir, ".ignore");
     }
 
-    fn load(self: *Ignorer, dir: std.fs.Dir, name: []const u8) !void {
+    pub fn popDir(self: *Stack) void {
+        const frame = self.frames.pop().?;
+        while (self.rules.items.len > frame.rules_start) {
+            const r = self.rules.pop().?;
+            self.allocator.free(r.pat);
+        }
+        self.allocator.free(frame.base);
+    }
+
+    pub fn ignored(self: *const Stack, rel_path: []const u8, is_dir: bool) bool {
+        if (defaultSkip(rel_path)) return true;
+
+        var ignored_: bool = false;
+        for (self.rules.items) |r| {
+            if (r.dir_only and !is_dir) continue;
+
+            const base = self.frames.items[r.frame].base;
+            const target = r.target(rel_path, base) orelse continue;
+
+            if (!matchPat(r.pat, target, r.anchored or r.has_slash)) continue;
+            ignored_ = !r.neg;
+        }
+        return ignored_;
+    }
+
+    fn load(self: *Stack, dir: std.fs.Dir, name: []const u8) !void {
         const data = dir.readFileAlloc(self.allocator, name, 1 << 20) catch |e| switch (e) {
             error.FileNotFound => return,
             else => return e,
@@ -37,84 +65,76 @@ pub const Ignorer = struct {
 
         var it = std.mem.splitScalar(u8, data, '\n');
         while (it.next()) |raw| {
-            const line = std.mem.trim(u8, raw, " \t\r");
+            var line = std.mem.trim(u8, raw, " \t\r");
             if (line.len == 0) continue;
-            if (line[0] == '#') continue;
+
+            if (line[0] == '\\' and line.len >= 2 and (line[1] == '#' or line[1] == '!')) {
+                line = line[1..];
+            } else if (line[0] == '#') continue;
 
             var neg = false;
-            var s = line;
-            if (s[0] == '!') {
+            if (line[0] == '!') {
                 neg = true;
-                s = std.mem.trimLeft(u8, s[1..], " \t");
-                if (s.len == 0) continue;
+                line = line[1..];
+                if (line.len == 0) continue;
             }
-            try self.pats.append(self.allocator, .{ .s = try self.allocator.dupe(u8, s), .neg = neg });
+
+            var anchored = false;
+            if (line[0] == '/') {
+                anchored = true;
+                line = line[1..];
+                if (line.len == 0) continue;
+            }
+
+            var dir_only = false;
+            if (line.len > 0 and line[line.len - 1] == '/') {
+                dir_only = true;
+                line = line[0 .. line.len - 1];
+                if (line.len == 0) continue;
+            }
+
+            try self.rules.append(self.allocator, .{
+                .frame = self.frames.items.len - 1,
+                .pat = try self.allocator.dupe(u8, line),
+                .neg = neg,
+                .dir_only = dir_only,
+                .anchored = anchored,
+                .has_slash = std.mem.indexOfScalar(u8, line, std.fs.path.sep) != null,
+            });
         }
     }
 };
 
-const Pat = struct {
-    s: []const u8,
-    neg: bool = false,
+const Frame = struct {
+    base: []const u8,
+    rules_start: usize,
+};
 
-    fn matches(self: Pat, rel_path: []const u8, is_dir: bool) bool {
-        _ = is_dir;
-        var pat = self.s;
-        var anchored = false;
-        if (pat.len > 0 and pat[0] == '/') {
-            anchored = true;
-            pat = pat[1..];
-        }
+const Rule = struct {
+    frame: usize,
+    pat: []const u8,
+    neg: bool,
+    dir_only: bool,
+    anchored: bool,
+    has_slash: bool,
 
-        const dir_only = pat.len > 0 and pat[pat.len - 1] == '/';
-        if (dir_only) pat = pat[0 .. pat.len - 1];
-
-        if (pat.len == 0) return false;
-
-        if (hasGlob(pat)) {
-            if (anchored) return globMatch(pat, rel_path);
-            return globMatchAny(pat, rel_path);
-        }
-
-        if (dir_only) {
-            if (anchored) {
-                if (std.mem.eql(u8, rel_path, pat)) return true;
-                return rel_path.len > pat.len and std.mem.startsWith(u8, rel_path, pat) and rel_path[pat.len] == std.fs.path.sep;
-            }
-            return hasPathComponent(rel_path, pat);
-        }
-
-        if (anchored) return std.mem.startsWith(u8, rel_path, pat);
-        return std.mem.indexOf(u8, rel_path, pat) != null;
+    fn target(self: Rule, rel_path: []const u8, base: []const u8) ?[]const u8 {
+        _ = self;
+        if (base.len == 0) return if (std.mem.startsWith(u8, rel_path, "./")) rel_path[2..] else rel_path;
+        if (std.mem.eql(u8, rel_path, base)) return "";
+        if (rel_path.len <= base.len + 1) return null;
+        if (!std.mem.startsWith(u8, rel_path, base)) return null;
+        if (rel_path[base.len] != std.fs.path.sep) return null;
+        return rel_path[base.len + 1 ..];
     }
 };
 
-fn hasPathComponent(rel_path: []const u8, name: []const u8) bool {
-    if (std.mem.eql(u8, rel_path, name)) return true;
-    var i: usize = 0;
-    while (i < rel_path.len) {
-        const start = i;
-        while (i < rel_path.len and rel_path[i] != std.fs.path.sep) i += 1;
-        if (std.mem.eql(u8, rel_path[start..i], name)) return true;
-        i += 1;
+fn matchPat(pat: []const u8, target: []const u8, full_path: bool) bool {
+    if (!full_path and std.mem.indexOfScalar(u8, pat, std.fs.path.sep) == null) {
+        const base = std.fs.path.basename(target);
+        return globMatch(pat, base);
     }
-    return false;
-}
-
-fn hasGlob(pat: []const u8) bool {
-    return std.mem.indexOfAny(u8, pat, "*?") != null;
-}
-
-fn globMatchAny(pat: []const u8, rel_path: []const u8) bool {
-    if (globMatch(pat, rel_path)) return true;
-    var i: usize = 0;
-    while (i < rel_path.len) : (i += 1) {
-        if (rel_path[i] == std.fs.path.sep) {
-            const rest = rel_path[i + 1 ..];
-            if (globMatch(pat, rest)) return true;
-        }
-    }
-    return false;
+    return globMatch(pat, target);
 }
 
 fn globMatch(pat: []const u8, s: []const u8) bool {
@@ -122,29 +142,58 @@ fn globMatch(pat: []const u8, s: []const u8) bool {
     var si: usize = 0;
     var star_pi: ?usize = null;
     var star_si: usize = 0;
+    var star_slash: bool = false;
 
     while (si < s.len) {
-        if (pi < pat.len and (pat[pi] == '?' or pat[pi] == s[si])) {
+        if (pi < pat.len and pat[pi] == '\\' and pi + 1 < pat.len) {
+            if (pat[pi + 1] == s[si]) {
+                pi += 2;
+                si += 1;
+                continue;
+            }
+        }
+
+        if (pi < pat.len and pat[pi] == '?') {
+            if (s[si] == std.fs.path.sep) {} else {
+                pi += 1;
+                si += 1;
+                continue;
+            }
+        }
+
+        if (pi < pat.len and pat[pi] == '*') {
+            star_slash = pi + 1 < pat.len and pat[pi + 1] == '*';
+            star_pi = if (star_slash) pi + 2 else pi + 1;
+            pi = star_pi.?;
+            star_si = si;
+            continue;
+        }
+
+        if (pi < pat.len and pat[pi] == s[si]) {
             pi += 1;
             si += 1;
             continue;
         }
-        if (pi < pat.len and pat[pi] == '*') {
-            star_pi = pi;
-            pi += 1;
-            star_si = si;
-            continue;
-        }
+
         if (star_pi) |spi| {
-            pi = spi + 1;
+            if (!star_slash and s[star_si] == std.fs.path.sep) return false;
             star_si += 1;
             si = star_si;
+            pi = spi;
             continue;
         }
         return false;
     }
 
-    while (pi < pat.len and pat[pi] == '*') pi += 1;
+    while (pi < pat.len) {
+        if (pat[pi] == '*') {
+            pi += 1;
+            if (pi < pat.len and pat[pi] == '*') pi += 1;
+            continue;
+        }
+        if (pat[pi] == '\\' and pi + 1 < pat.len) return false;
+        break;
+    }
     return pi == pat.len;
 }
 
@@ -159,17 +208,28 @@ fn defaultSkip(rel_path: []const u8) bool {
         std.mem.indexOf(u8, rel_path, "/zig-out/") != null;
 }
 
-test "ignore basic patterns" {
+test "stack honors per-dir ignore" {
     var td = std.testing.tmpDir(.{});
     defer td.cleanup();
 
-    try td.dir.writeFile(.{ .sub_path = ".gitignore", .data = "*.log\n!keep.log\nnode_modules/\n" });
+    try td.dir.makeDir("a");
+    try td.dir.makeDir("a/b");
+    try td.dir.writeFile(.{ .sub_path = ".gitignore", .data = "*.log\n" });
+    try td.dir.writeFile(.{ .sub_path = "a/.gitignore", .data = "!keep.log\n" });
 
-    var ign = try Ignorer.init(std.testing.allocator, td.dir);
-    defer ign.deinit();
+    var st = Stack.init(std.testing.allocator);
+    defer st.deinit();
+    try st.pushDir(td.dir, "");
 
-    try std.testing.expect(ign.match("a.log", false));
-    try std.testing.expect(!ign.match("keep.log", false));
-    try std.testing.expect(ign.match("node_modules", true));
-    try std.testing.expect(ign.match("node_modules/x.js", false));
+    try std.testing.expect(st.ignored("x.log", false));
+    try std.testing.expect(st.ignored("a/x.log", false));
+
+    var a = try td.dir.openDir("a", .{ .iterate = true });
+    defer a.close();
+    try st.pushDir(a, "a");
+    defer st.popDir();
+
+    try std.testing.expect(!st.ignored("a/keep.log", false));
+    try std.testing.expect(st.ignored("a/nope.log", false));
 }
+
