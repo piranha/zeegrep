@@ -331,6 +331,10 @@ pub fn printUsage(comptime T: type, writer: anytype) void {
             writer.print(" - {s}", .{T.about.desc}) catch return;
         }
         writer.writeAll("\n\n") catch return;
+        if (@hasField(@TypeOf(T.about), "usage")) {
+            writer.writeAll(T.about.usage) catch return;
+            writer.writeAll("\n") catch return;
+        }
     }
 
     writer.writeAll("Options:\n") catch return;

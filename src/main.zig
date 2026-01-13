@@ -2,6 +2,7 @@ const std = @import("std");
 const opt = @import("core/opt.zig");
 const run = @import("run.zig");
 const ansi = @import("core/ansi.zig");
+const build_options = @import("build_options");
 
 const Options = struct {
     replace: ?[]const u8 = null,
@@ -36,7 +37,23 @@ const Options = struct {
         .exclude = .{ .short = 'x', .help = "Skip paths containing substring (repeatable)" },
     };
 
-    pub const about = .{ .name = "zeegrep", .desc = "zee search & replace tool" };
+    pub const about = .{
+        .name = "zeegrep",
+        .desc = "zee search & replace tool",
+        .usage =
+        \\Usage: zg <pattern> [path] [options]
+        \\       zg <pattern> -r <replacement> [path] [options]
+        \\
+        \\Examples:
+        \\  zg pattern                 Search in current directory
+        \\  zg 'fn\s+\w+' src/         Regex search in specific path
+        \\  zg old -r new              Replace in-place
+        \\  zg old -r new -n           Dry-run, show diff
+        \\  zg 'foo(\d+)' -r 'bar$1'   Replace with capture groups
+        \\  zg pattern -x test -g clj  Filter paths by substring
+        \\
+        ,
+    };
 };
 
 pub fn main() !void {
@@ -50,6 +67,12 @@ pub fn main() !void {
     const args = argv[1..];
     if (args.len == 0) {
         opt.usage(Options);
+        return;
+    }
+
+    if (args.len == 1 and (std.mem.eql(u8, args[0], "--version") or std.mem.eql(u8, args[0], "-V"))) {
+        const stderr = std.fs.File.stderr().deprecatedWriter();
+        stderr.print("zeegrep {s}\n", .{build_options.version}) catch {};
         return;
     }
 
