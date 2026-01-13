@@ -19,8 +19,9 @@ pub fn run(allocator: std.mem.Allocator, writer: anytype, options: anytype, patt
     const before: u32 = if (options.context > 0) options.context else options.before;
     const after: u32 = if (options.context > 0) options.context else options.after;
 
+    // Jobs use per-thread arenas for temp work; only final output uses shared allocator
     var ts = std.heap.ThreadSafeAllocator{ .child_allocator = allocator };
-    const ta = ts.allocator();
+    const shared_alloc = ts.allocator();
 
     var pool: core_pool.Pool = .{};
     try pool.init(allocator, null);
@@ -32,7 +33,7 @@ pub fn run(allocator: std.mem.Allocator, writer: anytype, options: anytype, patt
     const use_color = ansi.enabled(options.color, is_tty, no_color != null);
     const use_heading = is_tty and options.replace == null and !options.quiet and !options.count and !options.file_names and isMultiPathSearch(cwd, paths);
 
-    var shared = Shared.init(ta, before, after, use_color, use_heading);
+    var shared = Shared.init(shared_alloc, before, after, use_color, use_heading);
     defer shared.deinit();
 
     var scope = pool.scope();
@@ -70,7 +71,7 @@ pub fn run(allocator: std.mem.Allocator, writer: anytype, options: anytype, patt
         .shared = &shared,
         .pat = &pat,
         .options = options,
-        .allocator = ta,
+        .allocator = shared_alloc,
         .cwd = cwd,
     };
     try core_walk.walkFiles(
@@ -88,7 +89,7 @@ pub fn run(allocator: std.mem.Allocator, writer: anytype, options: anytype, patt
 
     var first_out = true;
     for (shared.results.items) |r| {
-        defer ta.free(r.out);
+        defer shared_alloc.free(r.out);
         if (!options.quiet) {
             if (shared.heading and !first_out) try writer.writeByte('\n');
             first_out = false;
@@ -163,28 +164,29 @@ fn Job(comptime Opts: type) type {
     return struct {
         fn run(shared: *Shared, path: []const u8, options: Opts, pat: *const engine.Pattern) void {
             defer shared.allocator.free(path); // path was duped by walker
-            work(shared, path, options, pat) catch shared.fail();
+            // Per-job arena for temp work - avoids contention on shared allocator
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer arena.deinit();
+            work(arena.allocator(), shared, path, options, pat) catch shared.fail();
         }
 
-        fn work(shared: *Shared, path: []const u8, options: Opts, pat: *const engine.Pattern) !void {
+        fn work(tmp: std.mem.Allocator, shared: *Shared, path: []const u8, options: Opts, pat: *const engine.Pattern) !void {
             if (options.file_names) {
                 if (!engine.matchAny(pat, path, options.ignore_case)) return;
                 const n = engine.countMatches(pat, path, options.ignore_case);
                 shared.add(n, 0, false);
                 if (options.count and !options.quiet) {
                     var buf: std.ArrayListUnmanaged(u8) = .{};
-                    defer buf.deinit(shared.allocator);
-                    const w = buf.writer(shared.allocator);
+                    const w = buf.writer(tmp);
                     try w.print("{f}:{f}\n", .{ ansi.styled(shared.color, .path, path), ansi.styled(shared.color, .line_no, n) });
-                    shared.push(.{ .path = path, .out = try buf.toOwnedSlice(shared.allocator) });
+                    shared.push(.{ .path = path, .out = try shared.allocator.dupe(u8, buf.items) });
                     return;
                 }
                 if (!options.quiet and !options.count) {
                     var buf: std.ArrayListUnmanaged(u8) = .{};
-                    defer buf.deinit(shared.allocator);
-                    const w = buf.writer(shared.allocator);
+                    const w = buf.writer(tmp);
                     try w.print("{f}\n", .{ansi.styled(shared.color, .path, path)});
-                    shared.push(.{ .path = path, .out = try buf.toOwnedSlice(shared.allocator) });
+                    shared.push(.{ .path = path, .out = try shared.allocator.dupe(u8, buf.items) });
                 }
                 return;
             }
@@ -195,25 +197,23 @@ fn Job(comptime Opts: type) type {
             const stat = f.stat() catch return;
             if (stat.size == 0 or stat.size > 64 * 1024 * 1024) return;
 
-            const file_data = mapFile(shared.allocator, f, stat.size) catch return;
-            defer unmapFile(shared.allocator, file_data);
+            const file_data = mapFile(tmp, f, stat.size) catch return;
+            defer unmapFile(tmp, file_data);
             const data = file_data.ptr;
 
             if (isBinary(data)) return;
 
             if (options.replace) |repl| {
-                const rr = try engine.replaceAll(shared.allocator, pat, data, repl, options.ignore_case);
-                defer shared.allocator.free(rr.out);
+                const rr = try engine.replaceAll(tmp, pat, data, repl, options.ignore_case);
                 if (rr.n == 0) return;
 
-                if (!options.dry_run) try writeAtomic(shared.allocator, path, rr.out);
+                if (!options.dry_run) try writeAtomic(tmp, path, rr.out);
 
                 shared.add(0, rr.n, true);
                 if (options.dry_run and !options.quiet) {
                     var buf: std.ArrayListUnmanaged(u8) = .{};
-                    defer buf.deinit(shared.allocator);
-                    _ = try diff.printChangedLines(buf.writer(shared.allocator), shared.color, path, data, rr.out);
-                    shared.push(.{ .path = path, .out = try buf.toOwnedSlice(shared.allocator) });
+                    _ = try diff.printChangedLines(buf.writer(tmp), shared.color, path, data, rr.out);
+                    shared.push(.{ .path = path, .out = try shared.allocator.dupe(u8, buf.items) });
                 }
                 return;
             }
@@ -221,8 +221,7 @@ fn Job(comptime Opts: type) type {
             // Fast path: no context, stream output directly
             if (shared.before == 0 and shared.after == 0) {
                 var out: std.ArrayListUnmanaged(u8) = .{};
-                defer out.deinit(shared.allocator);
-                const w = out.writer(shared.allocator);
+                const w = out.writer(tmp);
 
                 var matches: usize = 0;
                 var line_no: usize = 1;
@@ -256,21 +255,18 @@ fn Job(comptime Opts: type) type {
                     try w.print("{f}:{f}\n", .{ ansi.styled(shared.color, .path, path), ansi.styled(shared.color, .line_no, matches) });
                 }
                 if (!options.quiet and out.items.len > 0) {
-                    shared.push(.{ .path = path, .out = try out.toOwnedSlice(shared.allocator) });
+                    shared.push(.{ .path = path, .out = try shared.allocator.dupe(u8, out.items) });
                 }
                 return;
             }
 
             // Slow path: context lines needed
-            const lines = try splitLines(shared.allocator, data);
-            defer shared.allocator.free(lines);
+            const lines = try splitLines(tmp, data);
 
-            var emit = try shared.allocator.alloc(bool, lines.len);
-            defer shared.allocator.free(emit);
+            const emit = try tmp.alloc(bool, lines.len);
             @memset(emit, false);
 
-            var is_match = try shared.allocator.alloc(bool, lines.len);
-            defer shared.allocator.free(is_match);
+            const is_match = try tmp.alloc(bool, lines.len);
             @memset(is_match, false);
 
             var matches: usize = 0;
@@ -293,17 +289,15 @@ fn Job(comptime Opts: type) type {
             if (options.count) {
                 if (options.quiet) return;
                 var buf: std.ArrayListUnmanaged(u8) = .{};
-                defer buf.deinit(shared.allocator);
-                const w = buf.writer(shared.allocator);
+                const w = buf.writer(tmp);
                 try w.print("{f}:{f}\n", .{ ansi.styled(shared.color, .path, path), ansi.styled(shared.color, .line_no, matches) });
-                shared.push(.{ .path = path, .out = try buf.toOwnedSlice(shared.allocator) });
+                shared.push(.{ .path = path, .out = try shared.allocator.dupe(u8, buf.items) });
                 return;
             }
             if (options.quiet) return;
 
             var out: std.ArrayListUnmanaged(u8) = .{};
-            defer out.deinit(shared.allocator);
-            const w = out.writer(shared.allocator);
+            const w = out.writer(tmp);
 
             var last: ?usize = null;
             if (shared.heading) {
@@ -327,7 +321,7 @@ fn Job(comptime Opts: type) type {
                 if (is_match[i]) try engine.writeHighlighted(shared.color, pat, w, ln, options.ignore_case) else try w.writeAll(ln);
                 try w.writeByte('\n');
             }
-            shared.push(.{ .path = path, .out = try out.toOwnedSlice(shared.allocator) });
+            shared.push(.{ .path = path, .out = try shared.allocator.dupe(u8, out.items) });
         }
     };
 }
