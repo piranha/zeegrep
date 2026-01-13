@@ -1,5 +1,6 @@
 const std = @import("std");
 const ignore = @import("ignore.zig");
+const glob = @import("glob.zig");
 
 pub fn collectFiles(
     allocator: std.mem.Allocator,
@@ -90,9 +91,17 @@ fn collectDir(
 }
 
 fn passes(path: []const u8, include: []const []const u8, exclude: []const []const u8) bool {
-    for (exclude) |x| if (std.mem.indexOf(u8, path, x) != null) return false;
+    for (exclude) |x| {
+        if (glob.isGlob(x)) {
+            if (glob.matchPath(x, path)) return false;
+        } else if (std.mem.indexOf(u8, path, x) != null) return false;
+    }
     if (include.len == 0) return true;
-    for (include) |g| if (std.mem.indexOf(u8, path, g) != null) return true;
+    for (include) |g| {
+        if (glob.isGlob(g)) {
+            if (glob.matchPath(g, path)) return true;
+        } else if (std.mem.indexOf(u8, path, g) != null) return true;
+    }
     return false;
 }
 
