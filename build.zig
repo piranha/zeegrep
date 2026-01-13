@@ -3,6 +3,8 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const version = b.option([]const u8, "version", "Version string") orelse "dev";
+    const output = b.option([]const u8, "output", "Custom output path (e.g., dist/zg-Linux-x86_64)");
 
     const pcre2_dep = b.dependency("pcre2", .{
         .target = target,
@@ -10,18 +12,27 @@ pub fn build(b: *std.Build) void {
     });
     const pcre2_lib = pcre2_dep.artifact("pcre2-8");
 
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "version", version);
+
     const exe_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
         .strip = optimize != .Debug,
     });
+    exe_module.addOptions("build_options", build_options);
     const exe = b.addExecutable(.{
         .name = "zg",
         .root_module = exe_module,
     });
     exe.linkLibrary(pcre2_lib);
+    if (output) |out_path| {
+        const install = b.addInstallFileWithDir(exe.getEmittedBin(), .prefix, out_path);
+        b.getInstallStep().dependOn(&install.step);
+    } else {
     b.installArtifact(exe);
+    }
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
