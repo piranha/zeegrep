@@ -33,7 +33,7 @@ pub fn run(allocator: std.mem.Allocator, writer: anytype, options: anytype, patt
     const use_color = ansi.enabled(options.color, is_tty, no_color != null);
     const use_heading = is_tty and options.replace == null and !options.quiet and !options.count and !options.file_names and isMultiPathSearch(cwd, paths);
 
-    var shared = Shared.init(shared_alloc, before, after, use_color, use_heading);
+    var shared = Shared.init(shared_alloc, before, after, use_color, use_heading, options.sort, writer.any());
     defer shared.deinit();
 
     var scope = pool.scope();
@@ -85,15 +85,18 @@ pub fn run(allocator: std.mem.Allocator, writer: anytype, options: anytype, patt
     );
     scope.wait();
 
-    if (options.sort) std.mem.sort(Result, shared.results.items, {}, Result.less);
-
-    var first_out = true;
-    for (shared.results.items) |r| {
-        defer shared_alloc.free(r.out);
-        if (!options.quiet) {
-            if (shared.heading and !first_out) try writer.writeByte('\n');
-            first_out = false;
-            try writer.writeAll(r.out);
+    // When sorting, results are buffered - sort and output them
+    // When not sorting, results were already streamed to stdout
+    if (options.sort) {
+        std.mem.sort(Result, shared.results.items, {}, Result.less);
+        var first_out = true;
+        for (shared.results.items) |r| {
+            defer shared_alloc.free(r.out);
+            if (!options.quiet) {
+                if (shared.heading and !first_out) try writer.writeByte('\n');
+                first_out = false;
+                try writer.writeAll(r.out);
+            }
         }
     }
 
@@ -120,17 +123,20 @@ const Shared = struct {
     after: u32,
     color: bool,
     heading: bool,
+    sort: bool,
+    writer: std.io.AnyWriter,
 
     mu: std.Thread.Mutex = .{},
     results: std.ArrayListUnmanaged(Result) = .{},
+    first_out: bool = true,
 
     total_matches: usize = 0,
     total_repls: usize = 0,
     files_changed: usize = 0,
     had_error: bool = false,
 
-    fn init(allocator: std.mem.Allocator, before: u32, after: u32, color: bool, heading: bool) Shared {
-        return .{ .allocator = allocator, .before = before, .after = after, .color = color, .heading = heading };
+    fn init(allocator: std.mem.Allocator, before: u32, after: u32, color: bool, heading: bool, sort: bool, writer: std.io.AnyWriter) Shared {
+        return .{ .allocator = allocator, .before = before, .after = after, .color = color, .heading = heading, .sort = sort, .writer = writer };
     }
 
     fn deinit(self: *Shared) void {
@@ -145,12 +151,27 @@ const Shared = struct {
         if (changed) self.files_changed += 1;
     }
 
-    fn push(self: *Shared, r: Result) void {
+    /// Output result: buffer if sorting, stream to writer if not
+    fn output(self: *Shared, path: []const u8, out: []const u8) void {
         self.mu.lock();
         defer self.mu.unlock();
-        self.results.append(self.allocator, r) catch {
-            self.had_error = true;
-        };
+        if (self.sort) {
+            self.results.append(self.allocator, .{
+                .path = path,
+                .out = self.allocator.dupe(u8, out) catch {
+                    self.had_error = true;
+                    return;
+                },
+            }) catch {
+                self.had_error = true;
+            };
+        } else {
+            if (self.heading and !self.first_out) self.writer.writeByte('\n') catch {};
+            self.first_out = false;
+            self.writer.writeAll(out) catch {
+                self.had_error = true;
+            };
+        }
     }
 
     fn fail(self: *Shared) void {
@@ -186,14 +207,14 @@ fn Job(comptime Opts: type) type {
                     var buf: std.ArrayListUnmanaged(u8) = .{};
                     const w = buf.writer(tmp);
                     try w.print("{f}:{f}\n", .{ ansi.styled(shared.color, .path, path), ansi.styled(shared.color, .line_no, n) });
-                    shared.push(.{ .path = path, .out = try shared.allocator.dupe(u8, buf.items) });
+                    shared.output(path, buf.items);
                     return;
                 }
                 if (!options.quiet and !options.count) {
                     var buf: std.ArrayListUnmanaged(u8) = .{};
                     const w = buf.writer(tmp);
                     try w.print("{f}\n", .{ansi.styled(shared.color, .path, path)});
-                    shared.push(.{ .path = path, .out = try shared.allocator.dupe(u8, buf.items) });
+                    shared.output(path, buf.items);
                 }
                 return;
             }
@@ -236,7 +257,7 @@ fn Job(comptime Opts: type) type {
                 if (options.dry_run and !options.quiet) {
                     var buf: std.ArrayListUnmanaged(u8) = .{};
                     _ = try diff.printChangedLines(buf.writer(tmp), shared.color, path, data, rr.out);
-                    shared.push(.{ .path = path, .out = try shared.allocator.dupe(u8, buf.items) });
+                    shared.output(path, buf.items);
                 }
                 return;
             }
@@ -278,7 +299,7 @@ fn Job(comptime Opts: type) type {
                     try w.print("{f}:{f}\n", .{ ansi.styled(shared.color, .path, path), ansi.styled(shared.color, .line_no, matches) });
                 }
                 if (!options.quiet and out.items.len > 0) {
-                    shared.push(.{ .path = path, .out = try shared.allocator.dupe(u8, out.items) });
+                    shared.output(path, out.items);
                 }
                 return;
             }
@@ -314,7 +335,7 @@ fn Job(comptime Opts: type) type {
                 var buf: std.ArrayListUnmanaged(u8) = .{};
                 const w = buf.writer(tmp);
                 try w.print("{f}:{f}\n", .{ ansi.styled(shared.color, .path, path), ansi.styled(shared.color, .line_no, matches) });
-                shared.push(.{ .path = path, .out = try shared.allocator.dupe(u8, buf.items) });
+                shared.output(path, buf.items);
                 return;
             }
             if (options.quiet) return;
@@ -344,7 +365,7 @@ fn Job(comptime Opts: type) type {
                 if (is_match[i]) try engine.writeHighlighted(shared.color, pat, w, ln, options.ignore_case) else try w.writeAll(ln);
                 try w.writeByte('\n');
             }
-            shared.push(.{ .path = path, .out = try shared.allocator.dupe(u8, out.items) });
+            shared.output(path, out.items);
         }
     };
 }
@@ -469,6 +490,15 @@ test "search and replace tmpdir" {
     _ = run(std.testing.allocator, fbs.writer(), o, "a.txt", &.{root}) catch {};
     out = fbs.getWritten();
     try std.testing.expect(std.mem.indexOf(u8, out, "a.txt") != null);
+
+    // Streaming (sort=false) - output goes directly to writer
+    fbs.reset();
+    o.file_names = false;
+    o.sort = false;
+    _ = run(std.testing.allocator, fbs.writer(), o, "foo", &.{root}) catch {};
+    out = fbs.getWritten();
+    try std.testing.expect(std.mem.indexOf(u8, out, "a.txt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "foo1") != null);
 }
 
 fn isMultiPathSearch(cwd: std.fs.Dir, paths: []const []const u8) bool {
