@@ -167,7 +167,14 @@ fn Job(comptime Opts: type) type {
             // Per-job arena for temp work - avoids contention on shared allocator
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
-            work(arena.allocator(), shared, path, options, pat) catch shared.fail();
+            work(arena.allocator(), shared, path, options, pat) catch |e| {
+                if (options.debug) debugSkip(path, @errorName(e));
+                shared.fail();
+            };
+        }
+
+        fn debugSkip(path: []const u8, reason: []const u8) void {
+            std.fs.File.stderr().deprecatedWriter().print("DEBUG: {s}: {s}\n", .{ path, reason }) catch {};
         }
 
         fn work(tmp: std.mem.Allocator, shared: *Shared, path: []const u8, options: Opts, pat: *const engine.Pattern) !void {
@@ -191,17 +198,33 @@ fn Job(comptime Opts: type) type {
                 return;
             }
 
-            var f = try std.fs.cwd().openFile(path, .{});
+            var f = std.fs.cwd().openFile(path, .{}) catch |e| {
+                if (options.debug) debugSkip(path, @errorName(e));
+                return;
+            };
             defer f.close();
 
-            const stat = f.stat() catch return;
-            if (stat.size == 0 or stat.size > 64 * 1024 * 1024) return;
+            const stat = f.stat() catch |e| {
+                if (options.debug) debugSkip(path, @errorName(e));
+                return;
+            };
+            if (stat.size == 0) return; // empty files aren't interesting
+            if (stat.size > 64 * 1024 * 1024) {
+                if (options.debug) debugSkip(path, "file too large (>64MB)");
+                return;
+            }
 
-            const file_data = mapFile(tmp, f, stat.size) catch return;
+            const file_data = mapFile(tmp, f, stat.size) catch |e| {
+                if (options.debug) debugSkip(path, @errorName(e));
+                return;
+            };
             defer unmapFile(tmp, file_data);
             const data = file_data.ptr;
 
-            if (isBinary(data)) return;
+            if (isBinary(data)) {
+                if (options.debug) debugSkip(path, "binary file");
+                return;
+            }
 
             if (options.replace) |repl| {
                 const rr = try engine.replaceAll(tmp, pat, data, repl, options.ignore_case);
@@ -398,6 +421,7 @@ test "search and replace tmpdir" {
         sort: bool = true,
         file_names: bool = false,
         hidden: bool = false,
+        debug: bool = false,
         color: ansi.Color = .never,
         include: @import("core/opt.zig").Multi([]const u8, 8) = .{},
         exclude: @import("core/opt.zig").Multi([]const u8, 8) = .{},

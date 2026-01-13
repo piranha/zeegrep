@@ -86,6 +86,7 @@ zg pattern -q                 # quiet, exit code only
 zg pattern --count            # per-file match count
 zg pattern --abs              # absolute paths in output
 zg pattern --color always     # force color output (auto|always|never)
+zg --debug pattern            # show skipped files (binary, >64MB, permission errors)
 ```
 
 ## File Filtering
