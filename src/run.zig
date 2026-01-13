@@ -190,11 +190,18 @@ fn Job(comptime Opts: type) type {
             var f = try std.fs.cwd().openFile(path, .{});
             defer f.close();
 
-            const data = f.readToEndAlloc(shared.allocator, 64 * 1024 * 1024) catch |e| switch (e) {
-                error.FileTooBig => return,
-                else => return e,
-            };
-            defer shared.allocator.free(data);
+            const stat = f.stat() catch return;
+            if (stat.size == 0 or stat.size > 64 * 1024 * 1024) return;
+
+            const data = std.posix.mmap(
+                null,
+                stat.size,
+                std.c.PROT.READ,
+                .{ .TYPE = .PRIVATE },
+                f.handle,
+                0,
+            ) catch return;
+            defer std.posix.munmap(data);
 
             if (isBinary(data)) return;
 
