@@ -76,10 +76,6 @@ pub fn run(allocator: std.mem.Allocator, writer: anytype, options: anytype, patt
         }
     }
 
-    if (options.count and !options.quiet and options.replace == null) {
-        try writer.print("{d}\n", .{shared.total_matches});
-    }
-
     if (options.replace != null and !options.quiet) {
         try writer.print("{d} files, {d} replacements\n", .{ shared.files_changed, shared.total_repls });
     }
@@ -154,19 +150,20 @@ fn Job(comptime Opts: type) type {
                 const base = std.fs.path.basename(path);
                 if (!engine.matchAny(pat, base, options.ignore_case)) return;
                 shared.add(1, 0, false);
+                if (options.count and !options.quiet) {
+                    var buf: std.ArrayListUnmanaged(u8) = .{};
+                    defer buf.deinit(shared.allocator);
+                    const w = buf.writer(shared.allocator);
+                    try w.print("{f}:{f}\n", .{ ansi.styled(shared.color, .path, path), ansi.styled(shared.color, .line_no, @as(usize, 1)) });
+                    shared.push(.{ .path = path, .out = try buf.toOwnedSlice(shared.allocator) });
+                    return;
+                }
                 if (!options.quiet and !options.count) {
-                    if (shared.color) {
-                        var buf: std.ArrayListUnmanaged(u8) = .{};
-                        defer buf.deinit(shared.allocator);
-                        const w = buf.writer(shared.allocator);
-                        try w.print("{f}\n", .{ansi.styled(true, .path, path)});
-                        shared.push(.{ .path = path, .out = try buf.toOwnedSlice(shared.allocator) });
-                        return;
-                    }
-                    shared.push(.{
-                        .path = path,
-                        .out = try std.fmt.allocPrint(shared.allocator, "{s}\n", .{path}),
-                    });
+                    var buf: std.ArrayListUnmanaged(u8) = .{};
+                    defer buf.deinit(shared.allocator);
+                    const w = buf.writer(shared.allocator);
+                    try w.print("{f}\n", .{ansi.styled(shared.color, .path, path)});
+                    shared.push(.{ .path = path, .out = try buf.toOwnedSlice(shared.allocator) });
                 }
                 return;
             }
@@ -226,7 +223,16 @@ fn Job(comptime Opts: type) type {
             if (matches == 0) return;
             shared.add(matches, 0, false);
 
-            if (options.count or options.quiet) return;
+            if (options.count) {
+                if (options.quiet) return;
+                var buf: std.ArrayListUnmanaged(u8) = .{};
+                defer buf.deinit(shared.allocator);
+                const w = buf.writer(shared.allocator);
+                try w.print("{f}:{f}\n", .{ ansi.styled(shared.color, .path, path), ansi.styled(shared.color, .line_no, matches) });
+                shared.push(.{ .path = path, .out = try buf.toOwnedSlice(shared.allocator) });
+                return;
+            }
+            if (options.quiet) return;
 
             var out: std.ArrayListUnmanaged(u8) = .{};
             defer out.deinit(shared.allocator);
@@ -251,11 +257,7 @@ fn Job(comptime Opts: type) type {
                 }
                 try w.print("{f}{c}", .{ ansi.styled(shared.color, .line_no, i + 1), sep });
 
-                if (is_match[i] and shared.color) {
-                    try engine.writeHighlighted(pat, w, ln, options.ignore_case);
-                } else {
-                    try w.writeAll(ln);
-                }
+                if (is_match[i]) try engine.writeHighlighted(shared.color, pat, w, ln, options.ignore_case) else try w.writeAll(ln);
                 try w.writeByte('\n');
             }
             shared.push(.{ .path = path, .out = try out.toOwnedSlice(shared.allocator) });
@@ -340,4 +342,14 @@ test "search and replace tmpdir" {
     out = fbs.getWritten();
     try std.testing.expect(std.mem.indexOf(u8, out, "replacements") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "──") != null);
+
+    // Count (per-file)
+    fbs.reset();
+    o.replace = null;
+    o.dry_run = false;
+    o.count = true;
+    _ = run(std.testing.allocator, fbs.writer(), o, "foo", &.{root}) catch {};
+    out = fbs.getWritten();
+    try std.testing.expect(std.mem.indexOf(u8, out, "a.txt:2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "b.txt") == null);
 }

@@ -54,7 +54,7 @@ zg pattern -g clj -x test     # combine: clj files, skip tests
 zg pattern -i                 # case insensitive
 zg pattern -C 3               # show 3 lines of context, also see -A, -B
 zg pattern -q                 # quiet, exit code only
-zg pattern --count            # just show match count
+zg pattern --count            # per-file match count
 zg pattern --abs              # absolute paths in output
 zg pattern --color always     # force color output (auto|always|never)
 ```

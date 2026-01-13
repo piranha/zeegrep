@@ -83,7 +83,7 @@ pub fn countMatches(code: *const Code, subject: []const u8) usize {
     return n;
 }
 
-pub fn writeHighlighted(code: *const Code, writer: anytype, subject: []const u8) !void {
+pub fn writeHighlighted(on: bool, code: *const Code, writer: anytype, subject: []const u8) !void {
     const md = c.pcre2_match_data_create_from_pattern_8(code.code.?, null) orelse return writer.writeAll(subject);
     defer c.pcre2_match_data_free_8(md);
 
@@ -105,7 +105,7 @@ pub fn writeHighlighted(code: *const Code, writer: anytype, subject: []const u8)
         if (start > subject.len or end > subject.len or end < start) break;
 
         try writer.writeAll(subject[off..start]);
-        try writer.print("{f}", .{ansi.styled(true, .match, subject[start..end])});
+        try writer.print("{f}", .{ansi.styled(on, .match, subject[start..end])});
 
         off = if (end > start) end else start + 1;
     }

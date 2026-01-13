@@ -52,10 +52,10 @@ pub fn replaceAll(allocator: std.mem.Allocator, pat: *const Pattern, hay: []cons
     }
 }
 
-pub fn writeHighlighted(pat: *const Pattern, writer: anytype, hay: []const u8, ignore_case: bool) !void {
+pub fn writeHighlighted(on: bool, pat: *const Pattern, writer: anytype, hay: []const u8, ignore_case: bool) !void {
     switch (pat.*) {
-        .literal => |needle| try writeHighlightedLiteral(writer, hay, needle, ignore_case),
-        .regex => |*code| try pcre2.writeHighlighted(code, writer, hay),
+        .literal => |needle| try writeHighlightedLiteral(on, writer, hay, needle, ignore_case),
+        .regex => |*code| try pcre2.writeHighlighted(on, code, writer, hay),
     }
 }
 
@@ -136,7 +136,7 @@ fn eqAsciiFold(a: []const u8, b: []const u8) bool {
     return true;
 }
 
-fn writeHighlightedLiteral(writer: anytype, hay: []const u8, needle: []const u8, ignore_case: bool) !void {
+fn writeHighlightedLiteral(on: bool, writer: anytype, hay: []const u8, needle: []const u8, ignore_case: bool) !void {
     if (needle.len == 0) return writer.writeAll(hay);
     var off: usize = 0;
     while (off + needle.len <= hay.len) {
@@ -147,7 +147,7 @@ fn writeHighlightedLiteral(writer: anytype, hay: []const u8, needle: []const u8,
         if (idx == null) break;
         const i = idx.?;
         try writer.writeAll(hay[off..i]);
-        try ansi.styled(true, .match, hay[i .. i + needle.len]).format(writer);
+        try ansi.styled(on, .match, hay[i .. i + needle.len]).format(writer);
         off = i + needle.len;
     }
     try writer.writeAll(hay[off..]);
