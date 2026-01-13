@@ -12,32 +12,6 @@ pub fn run(allocator: std.mem.Allocator, writer: anytype, options: anytype, patt
 
     if (options.file_names and options.replace != null) return error.InvalidArgs;
 
-    var ign = core_ignore.Stack.init(allocator);
-    defer ign.deinit();
-    try ign.pushDir(cwd, "");
-    defer ign.popDir();
-
-    var files: [][]const u8 = try core_walk.collectFiles(
-        allocator,
-        cwd,
-        &ign,
-        paths,
-        options.include.constSlice(),
-        options.exclude.constSlice(),
-    );
-    defer {
-        for (files) |p| allocator.free(p);
-        allocator.free(files);
-    }
-
-    if (options.abs) {
-        for (files, 0..) |p, i| {
-            const abs = cwd.realpathAlloc(allocator, p) catch continue;
-            allocator.free(p);
-            files[i] = abs;
-        }
-    }
-
     var pat = try engine.compile(allocator, pattern, options.ignore_case);
     defer pat.deinit();
 
@@ -61,7 +35,51 @@ pub fn run(allocator: std.mem.Allocator, writer: anytype, options: anytype, patt
     defer shared.deinit();
 
     var scope = pool.scope();
-    for (files) |p| scope.spawn(Job(@TypeOf(options)).run, .{ &shared, p, options, &pat });
+
+    // Walk and spawn jobs simultaneously (instead of collect-then-search)
+    var ign = core_ignore.Stack.init(allocator);
+    defer ign.deinit();
+    try ign.pushDir(cwd, "");
+    defer ign.popDir();
+
+    const Walker = struct {
+        scope: *core_pool.Scope,
+        shared: *Shared,
+        pat: *const engine.Pattern,
+        options: @TypeOf(options),
+        allocator: std.mem.Allocator,
+        cwd: std.fs.Dir,
+
+        pub fn onFile(self: *@This(), path: []const u8) void {
+            const p = self.allocator.dupe(u8, path) catch return;
+            if (self.options.abs) {
+                const abs = self.cwd.realpathAlloc(self.allocator, p) catch {
+                    self.allocator.free(p);
+                    return;
+                };
+                self.allocator.free(p);
+                self.scope.spawn(Job(@TypeOf(self.options)).run, .{ self.shared, abs, self.options, self.pat });
+            } else {
+                self.scope.spawn(Job(@TypeOf(self.options)).run, .{ self.shared, p, self.options, self.pat });
+            }
+        }
+    };
+    var walker = Walker{
+        .scope = &scope,
+        .shared = &shared,
+        .pat = &pat,
+        .options = options,
+        .allocator = ta,
+        .cwd = cwd,
+    };
+    try core_walk.walkFiles(
+        cwd,
+        &ign,
+        paths,
+        options.include.constSlice(),
+        options.exclude.constSlice(),
+        &walker,
+    );
     scope.wait();
 
     if (options.sort) std.mem.sort(Result, shared.results.items, {}, Result.less);
@@ -142,6 +160,7 @@ const Shared = struct {
 fn Job(comptime Opts: type) type {
     return struct {
         fn run(shared: *Shared, path: []const u8, options: Opts, pat: *const engine.Pattern) void {
+            defer shared.allocator.free(path); // path was duped by walker
             work(shared, path, options, pat) catch shared.fail();
         }
 
@@ -196,6 +215,50 @@ fn Job(comptime Opts: type) type {
                 return;
             }
 
+            // Fast path: no context, stream output directly
+            if (shared.before == 0 and shared.after == 0) {
+                var out: std.ArrayListUnmanaged(u8) = .{};
+                defer out.deinit(shared.allocator);
+                const w = out.writer(shared.allocator);
+
+                var matches: usize = 0;
+                var line_no: usize = 1;
+                var it = std.mem.splitScalar(u8, data, '\n');
+                var wrote_heading = false;
+
+                while (it.next()) |ln| : (line_no += 1) {
+                    const n = engine.countMatches(pat, ln, options.ignore_case);
+                    if (n == 0) continue;
+                    matches += n;
+
+                    if (options.quiet) continue;
+                    if (options.count) continue;
+
+                    if (shared.heading and !wrote_heading) {
+                        try w.print("{f}\n", .{ansi.styled(shared.color, .path, path)});
+                        wrote_heading = true;
+                    }
+                    if (!shared.heading) {
+                        try w.print("{f}:", .{ansi.styled(shared.color, .path, path)});
+                    }
+                    try w.print("{f}:", .{ansi.styled(shared.color, .line_no, line_no)});
+                    try engine.writeHighlighted(shared.color, pat, w, ln, options.ignore_case);
+                    try w.writeByte('\n');
+                }
+
+                if (matches == 0) return;
+                shared.add(matches, 0, false);
+
+                if (options.count and !options.quiet) {
+                    try w.print("{f}:{f}\n", .{ ansi.styled(shared.color, .path, path), ansi.styled(shared.color, .line_no, matches) });
+                }
+                if (!options.quiet and out.items.len > 0) {
+                    shared.push(.{ .path = path, .out = try out.toOwnedSlice(shared.allocator) });
+                }
+                return;
+            }
+
+            // Slow path: context lines needed
             const lines = try splitLines(shared.allocator, data);
             defer shared.allocator.free(lines);
 
@@ -209,9 +272,10 @@ fn Job(comptime Opts: type) type {
 
             var matches: usize = 0;
             for (lines, 0..) |ln, i| {
-                if (!engine.matchAny(pat, ln, options.ignore_case)) continue;
+                const n = engine.countMatches(pat, ln, options.ignore_case);
+                if (n == 0) continue;
                 is_match[i] = true;
-                matches += engine.countMatches(pat, ln, options.ignore_case);
+                matches += n;
 
                 const lo: usize = if (shared.before > i) 0 else i - shared.before;
                 var hi: usize = i + shared.after;
@@ -245,7 +309,7 @@ fn Job(comptime Opts: type) type {
             for (lines, 0..) |ln, i| {
                 if (!emit[i]) continue;
 
-                if ((shared.before > 0 or shared.after > 0) and last != null and i > last.? + 1) {
+                if (last != null and i > last.? + 1) {
                     try w.print("{f}\n", .{ansi.styled(shared.color, .dim, "--")});
                 }
                 last = i;

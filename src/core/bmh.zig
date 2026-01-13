@@ -65,15 +65,24 @@ pub const Matcher = struct {
 
     fn simdIndexOf(hay: []const u8, start: usize, needle: []const u8) ?usize {
         const Vec = @Vector(32, u8);
-        const first: Vec = @splat(needle[0]);
         const needle_len = needle.len;
 
+        // For short needles or small haystacks, use scalar
+        if (needle_len < 2 or hay.len < start + 32 + needle_len) {
+            return std.mem.indexOfPos(u8, hay, start, needle);
+        }
+
+        // Two-byte prefix for fewer false positives
+        const first: Vec = @splat(needle[0]);
+        const second: Vec = @splat(needle[1]);
+
         var i: usize = start;
-        // SIMD loop: process 32 bytes at a time
         while (i + 32 + needle_len - 1 <= hay.len) {
-            const chunk: Vec = hay[i..][0..32].*;
-            const eq = chunk == first;
-            var mask: u32 = @bitCast(eq);
+            const chunk1: Vec = hay[i..][0..32].*;
+            const chunk2: Vec = hay[i + 1 ..][0..32].*;
+            const eq1 = chunk1 == first;
+            const eq2 = chunk2 == second;
+            var mask: u32 = @bitCast(eq1 & eq2); // Both bytes must match
             while (mask != 0) {
                 const bit: u5 = @truncate(@ctz(mask));
                 const pos = i + bit;
@@ -82,7 +91,6 @@ pub const Matcher = struct {
             }
             i += 32;
         }
-        // Scalar tail
         return std.mem.indexOfPos(u8, hay, i, needle);
     }
 

@@ -25,6 +25,95 @@ pub fn collectFiles(
     return try list.toOwnedSlice(allocator);
 }
 
+/// Walk files and call callback for each file (streaming, no collection)
+pub fn walkFiles(
+    cwd: std.fs.Dir,
+    ign: *ignore.Stack,
+    paths: []const []const u8,
+    include: []const []const u8,
+    exclude: []const []const u8,
+    ctx: anytype,
+) !void {
+    if (paths.len == 0) {
+        try walkRoot(cwd, ign, ".", include, exclude, ctx);
+    } else for (paths) |root| {
+        try walkRoot(cwd, ign, root, include, exclude, ctx);
+    }
+}
+
+fn walkRoot(
+    cwd: std.fs.Dir,
+    ign: *ignore.Stack,
+    root: []const u8,
+    include: []const []const u8,
+    exclude: []const []const u8,
+    ctx: anytype,
+) !void {
+    const st = cwd.statFile(root) catch |e| switch (e) {
+        error.FileNotFound => return,
+        else => return e,
+    };
+
+    if (st.kind == .directory) {
+        const prefix = if (std.mem.eql(u8, root, ".") or std.mem.eql(u8, root, "./")) "" else root;
+        var d = try cwd.openDir(root, .{ .iterate = true });
+        defer d.close();
+        if (prefix.len != 0) {
+            try ign.pushDir(d, prefix);
+            defer ign.popDir();
+        }
+        try walkDir(cwd, ign, prefix, d, include, exclude, ctx);
+    } else {
+        if (!passesFile(root, include, exclude)) return;
+        if (ign.ignored(root, false)) return;
+        ctx.onFile(root);
+    }
+}
+
+fn walkDir(
+    cwd: std.fs.Dir,
+    ign: *ignore.Stack,
+    prefix: []const u8,
+    dir: std.fs.Dir,
+    include: []const []const u8,
+    exclude: []const []const u8,
+    ctx: anytype,
+) !void {
+    var pathbuf: [std.fs.max_path_bytes]u8 = undefined;
+    var it = dir.iterate();
+    while (try it.next()) |ent| {
+        const rel = if (prefix.len == 0)
+            ent.name
+        else blk: {
+            const len = prefix.len + 1 + ent.name.len;
+            if (len > pathbuf.len) continue;
+            @memcpy(pathbuf[0..prefix.len], prefix);
+            pathbuf[prefix.len] = '/';
+            @memcpy(pathbuf[prefix.len + 1 ..][0..ent.name.len], ent.name);
+            break :blk pathbuf[0..len];
+        };
+
+        if (ent.kind == .directory) {
+            if (excluded(rel, exclude)) continue;
+        } else {
+            if (!passesFile(rel, include, exclude)) continue;
+        }
+        if (ign.ignored(rel, ent.kind == .directory)) continue;
+
+        switch (ent.kind) {
+            .file => ctx.onFile(rel),
+            .directory => {
+                var sub = try cwd.openDir(rel, .{ .iterate = true });
+                defer sub.close();
+                try ign.pushDir(sub, rel);
+                defer ign.popDir();
+                try walkDir(cwd, ign, rel, sub, include, exclude, ctx);
+            },
+            else => {},
+        }
+    }
+}
+
 fn collectRoot(
     allocator: std.mem.Allocator,
     cwd: std.fs.Dir,
