@@ -4,6 +4,12 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const pcre2_dep = b.dependency("pcre2", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const pcre2_lib = pcre2_dep.artifact("pcre2-8");
+
     const exe_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -14,11 +20,7 @@ pub fn build(b: *std.Build) void {
         .name = "zg",
         .root_module = exe_module,
     });
-    exe.root_module.linkSystemLibrary("libpcre2-8", .{
-        .use_pkg_config = .force,
-        .preferred_link_mode = .static,
-        .search_strategy = .mode_first,
-    });
+    exe.linkLibrary(pcre2_lib);
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
@@ -42,11 +44,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     const run_tests = b.addTest(.{ .root_module = run_test_module });
-    run_tests.root_module.linkSystemLibrary("libpcre2-8", .{
-        .use_pkg_config = .force,
-        .preferred_link_mode = .static,
-        .search_strategy = .mode_first,
-    });
+    run_tests.linkLibrary(pcre2_lib);
     const run_run_tests = b.addRunArtifact(run_tests);
 
     const test_step = b.step("test", "Run unit tests");

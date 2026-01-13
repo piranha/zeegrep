@@ -1,7 +1,12 @@
 .{
     .name = .zeegrep,
     .version = "0.15.2",
-    .dependencies = .{},
+    .dependencies = .{
+        .pcre2 = .{
+            .url = "git+https://github.com/PCRE2Project/pcre2?ref=pcre2-10.47#f454e231fe5006dd7ff8f4693fd2b8eb94333429",
+            .hash = "N-V-__8AAMjt_AAUBWcWGMrSWOBMKFHM-GSJ3slFUKs5-lVW",
+        },
+    },
     .paths = .{""},
     .fingerprint = 0x6594ab950c0a50d4,
 }
