@@ -91,6 +91,7 @@ pub fn run(allocator: std.mem.Allocator, writer: anytype, options: anytype, patt
         std.mem.sort(Result, shared.results.items, {}, Result.less);
         var first_out = true;
         for (shared.results.items) |r| {
+            defer shared_alloc.free(r.path);
             defer shared_alloc.free(r.out);
             if (!options.quiet) {
                 if (shared.heading and !first_out) try writer.writeByte('\n');
@@ -157,7 +158,10 @@ const Shared = struct {
         defer self.mu.unlock();
         if (self.sort) {
             self.results.append(self.allocator, .{
-                .path = path,
+                .path = self.allocator.dupe(u8, path) catch {
+                    self.had_error = true;
+                    return;
+                },
                 .out = self.allocator.dupe(u8, out) catch {
                     self.had_error = true;
                     return;
