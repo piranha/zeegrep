@@ -40,10 +40,13 @@ pub const Stack = struct {
         self.allocator.free(frame.base);
     }
 
-    pub fn ignored(self: *const Stack, rel_path: []const u8, is_dir: bool) bool {
+    pub fn ignored(self: *const Stack, rel_path: []const u8, is_dir: bool, hidden: bool) bool {
         if (defaultSkip(rel_path)) return true;
 
-        var ignored_: bool = false;
+        // Dotfiles start as "ignored" unless --hidden; gitignore negation can override
+        const name = std.fs.path.basename(rel_path);
+        var ignored_: bool = !hidden and name.len > 0 and name[0] == '.';
+
         for (self.rules.items) |r| {
             if (r.dir_only and !is_dir) continue;
 
@@ -153,12 +156,10 @@ fn globMatch(pat: []const u8, s: []const u8) bool {
             }
         }
 
-        if (pi < pat.len and pat[pi] == '?') {
-            if (s[si] == std.fs.path.sep) {} else {
-                pi += 1;
-                si += 1;
-                continue;
-            }
+        if (pi < pat.len and pat[pi] == '?' and s[si] != std.fs.path.sep) {
+            pi += 1;
+            si += 1;
+            continue;
         }
 
         if (pi < pat.len and pat[pi] == '*') {
@@ -221,15 +222,15 @@ test "stack honors per-dir ignore" {
     defer st.deinit();
     try st.pushDir(td.dir, "");
 
-    try std.testing.expect(st.ignored("x.log", false));
-    try std.testing.expect(st.ignored("a/x.log", false));
+    try std.testing.expect(st.ignored("x.log", false, true));
+    try std.testing.expect(st.ignored("a/x.log", false, true));
 
     var a = try td.dir.openDir("a", .{ .iterate = true });
     defer a.close();
     try st.pushDir(a, "a");
     defer st.popDir();
 
-    try std.testing.expect(!st.ignored("a/keep.log", false));
-    try std.testing.expect(st.ignored("a/nope.log", false));
+    try std.testing.expect(!st.ignored("a/keep.log", false, true));
+    try std.testing.expect(st.ignored("a/nope.log", false, true));
 }
 

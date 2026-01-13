@@ -9,6 +9,7 @@ pub fn collectFiles(
     paths: []const []const u8,
     include: []const []const u8,
     exclude: []const []const u8,
+    hidden: bool,
 ) ![][]const u8 {
     var list: std.ArrayListUnmanaged([]const u8) = .{};
     errdefer {
@@ -17,9 +18,9 @@ pub fn collectFiles(
     }
 
     if (paths.len == 0) {
-        try collectRoot(allocator, cwd, ign, &list, ".", include, exclude);
+        try collectRoot(allocator, cwd, ign, &list, ".", include, exclude, hidden);
     } else for (paths) |root| {
-        try collectRoot(allocator, cwd, ign, &list, root, include, exclude);
+        try collectRoot(allocator, cwd, ign, &list, root, include, exclude, hidden);
     }
 
     return try list.toOwnedSlice(allocator);
@@ -32,12 +33,13 @@ pub fn walkFiles(
     paths: []const []const u8,
     include: []const []const u8,
     exclude: []const []const u8,
+    hidden: bool,
     ctx: anytype,
 ) !void {
     if (paths.len == 0) {
-        try walkRoot(cwd, ign, ".", include, exclude, ctx);
+        try walkRoot(cwd, ign, ".", include, exclude, hidden, ctx);
     } else for (paths) |root| {
-        try walkRoot(cwd, ign, root, include, exclude, ctx);
+        try walkRoot(cwd, ign, root, include, exclude, hidden, ctx);
     }
 }
 
@@ -47,6 +49,7 @@ fn walkRoot(
     root: []const u8,
     include: []const []const u8,
     exclude: []const []const u8,
+    hidden: bool,
     ctx: anytype,
 ) !void {
     const st = cwd.statFile(root) catch |e| switch (e) {
@@ -62,10 +65,10 @@ fn walkRoot(
             try ign.pushDir(d, prefix);
             defer ign.popDir();
         }
-        try walkDir(cwd, ign, prefix, d, include, exclude, ctx);
+        try walkDir(cwd, ign, prefix, d, include, exclude, hidden, ctx);
     } else {
         if (!passesFile(root, include, exclude)) return;
-        if (ign.ignored(root, false)) return;
+        if (ign.ignored(root, false, hidden)) return;
         ctx.onFile(root);
     }
 }
@@ -77,11 +80,13 @@ fn walkDir(
     dir: std.fs.Dir,
     include: []const []const u8,
     exclude: []const []const u8,
+    hidden: bool,
     ctx: anytype,
 ) !void {
     var pathbuf: [std.fs.max_path_bytes]u8 = undefined;
     var it = dir.iterate();
     while (try it.next()) |ent| {
+
         const rel = if (prefix.len == 0)
             ent.name
         else blk: {
@@ -98,7 +103,7 @@ fn walkDir(
         } else {
             if (!passesFile(rel, include, exclude)) continue;
         }
-        if (ign.ignored(rel, ent.kind == .directory)) continue;
+        if (ign.ignored(rel, ent.kind == .directory, hidden)) continue;
 
         switch (ent.kind) {
             .file => ctx.onFile(rel),
@@ -107,7 +112,7 @@ fn walkDir(
                 defer sub.close();
                 try ign.pushDir(sub, rel);
                 defer ign.popDir();
-                try walkDir(cwd, ign, rel, sub, include, exclude, ctx);
+                try walkDir(cwd, ign, rel, sub, include, exclude, hidden, ctx);
             },
             else => {},
         }
@@ -122,26 +127,27 @@ fn collectRoot(
     root: []const u8,
     include: []const []const u8,
     exclude: []const []const u8,
+    hidden: bool,
 ) !void {
     const st = cwd.statFile(root) catch |e| switch (e) {
         error.FileNotFound => return,
         else => return e,
     };
 
-        if (st.kind == .directory) {
-            const prefix = if (std.mem.eql(u8, root, ".") or std.mem.eql(u8, root, "./")) "" else root;
-            var d = try cwd.openDir(root, .{ .iterate = true });
-            defer d.close();
-            if (prefix.len != 0) {
-                try ign.pushDir(d, prefix);
-                defer ign.popDir();
-            }
-            try collectDir(allocator, cwd, ign, list, prefix, d, include, exclude);
-        } else {
-            if (!passesFile(root, include, exclude)) return;
-            if (ign.ignored(root, false)) return;
-            try list.append(allocator, try allocator.dupe(u8, root));
+    if (st.kind == .directory) {
+        const prefix = if (std.mem.eql(u8, root, ".") or std.mem.eql(u8, root, "./")) "" else root;
+        var d = try cwd.openDir(root, .{ .iterate = true });
+        defer d.close();
+        if (prefix.len != 0) {
+            try ign.pushDir(d, prefix);
+            defer ign.popDir();
         }
+        try collectDir(allocator, cwd, ign, list, prefix, d, include, exclude, hidden);
+    } else {
+        if (!passesFile(root, include, exclude)) return;
+        if (ign.ignored(root, false, hidden)) return;
+        try list.append(allocator, try allocator.dupe(u8, root));
+    }
 }
 
 fn collectDir(
@@ -153,6 +159,7 @@ fn collectDir(
     dir: std.fs.Dir,
     include: []const []const u8,
     exclude: []const []const u8,
+    hidden: bool,
 ) !void {
     var it = dir.iterate();
     while (try it.next()) |ent| {
@@ -167,7 +174,7 @@ fn collectDir(
         } else {
             if (!passesFile(rel, include, exclude)) continue;
         }
-        if (ign.ignored(rel, ent.kind == .directory)) continue;
+        if (ign.ignored(rel, ent.kind == .directory, hidden)) continue;
 
         switch (ent.kind) {
             .file => try list.append(allocator, try allocator.dupe(u8, rel)),
@@ -176,7 +183,7 @@ fn collectDir(
                 defer sub.close();
                 try ign.pushDir(sub, rel);
                 defer ign.popDir();
-                try collectDir(allocator, cwd, ign, list, rel, sub, include, exclude);
+                try collectDir(allocator, cwd, ign, list, rel, sub, include, exclude, hidden);
             },
             else => {},
         }
@@ -217,7 +224,7 @@ test "collect files with include/exclude" {
     try ign.pushDir(td.dir, "");
     defer ign.popDir();
 
-    const got = try collectFiles(std.testing.allocator, td.dir, &ign, &.{ "." }, &.{ "src" }, &.{ "test" });
+    const got = try collectFiles(std.testing.allocator, td.dir, &ign, &.{ "." }, &.{ "src" }, &.{ "test" }, false);
     defer {
         for (got) |p| std.testing.allocator.free(p);
         std.testing.allocator.free(got);
@@ -238,7 +245,7 @@ test "include does not prune directories" {
     try ign.pushDir(td.dir, "");
     defer ign.popDir();
 
-    const got = try collectFiles(std.testing.allocator, td.dir, &ign, &.{ "." }, &.{ "run" }, &.{});
+    const got = try collectFiles(std.testing.allocator, td.dir, &ign, &.{ "." }, &.{ "run" }, &.{}, false);
     defer {
         for (got) |p| std.testing.allocator.free(p);
         std.testing.allocator.free(got);

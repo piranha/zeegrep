@@ -30,7 +30,7 @@ pub fn run(allocator: std.mem.Allocator, writer: anytype, options: anytype, patt
     const no_color = std.process.getEnvVarOwned(allocator, "NO_COLOR") catch null;
     defer if (no_color) |v| allocator.free(v);
     const use_color = ansi.enabled(options.color, is_tty, no_color != null);
-    const use_heading = options.replace == null and !options.quiet and !options.count and !options.file_names and isMultiPathSearch(cwd, paths);
+    const use_heading = is_tty and options.replace == null and !options.quiet and !options.count and !options.file_names and isMultiPathSearch(cwd, paths);
 
     var shared = Shared.init(ta, before, after, use_color, use_heading);
     defer shared.deinit();
@@ -79,6 +79,7 @@ pub fn run(allocator: std.mem.Allocator, writer: anytype, options: anytype, patt
         paths,
         options.include.constSlice(),
         options.exclude.constSlice(),
+        options.hidden,
         &walker,
     );
     scope.wait();
@@ -402,6 +403,7 @@ test "search and replace tmpdir" {
         abs: bool = false,
         sort: bool = true,
         file_names: bool = false,
+        hidden: bool = false,
         color: ansi.Color = .never,
         include: @import("core/opt.zig").Multi([]const u8, 8) = .{},
         exclude: @import("core/opt.zig").Multi([]const u8, 8) = .{},
