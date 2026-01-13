@@ -385,13 +385,46 @@ fn isBinary(data: []const u8) bool {
 
 const FileData = struct {
     ptr: []const u8,
+    section_handle: if (builtin.os.tag == .windows) std.os.windows.HANDLE else void = if (builtin.os.tag == .windows) undefined else {},
 };
 
 fn mapFile(allocator: std.mem.Allocator, f: std.fs.File, size: u64) !FileData {
+    _ = allocator;
     if (comptime builtin.os.tag == .windows) {
-        const buf = try allocator.alloc(u8, size);
-        const n = try f.readAll(buf);
-        return .{ .ptr = buf[0..n] };
+        const w = std.os.windows;
+        var section_handle: w.HANDLE = undefined;
+        const create_rc = w.ntdll.NtCreateSection(
+            &section_handle,
+            w.STANDARD_RIGHTS_REQUIRED | w.SECTION_QUERY | w.SECTION_MAP_READ,
+            null,
+            null,
+            w.PAGE_READONLY,
+            w.SEC_COMMIT,
+            f.handle,
+        );
+        if (create_rc != .SUCCESS) return error.MmapFailed;
+        errdefer w.CloseHandle(section_handle);
+
+        var view_size: usize = 0;
+        var base_ptr: usize = 0;
+        const map_rc = w.ntdll.NtMapViewOfSection(
+            section_handle,
+            w.GetCurrentProcess(),
+            @ptrCast(&base_ptr),
+            null,
+            0,
+            null,
+            &view_size,
+            .ViewUnmap,
+            0,
+            w.PAGE_READONLY,
+        );
+        if (map_rc != .SUCCESS) return error.MmapFailed;
+
+        return .{
+            .ptr = @as([*]const u8, @ptrFromInt(base_ptr))[0..size],
+            .section_handle = section_handle,
+        };
     } else {
         const data = try std.posix.mmap(null, size, std.c.PROT.READ, .{ .TYPE = .PRIVATE }, f.handle, 0);
         return .{ .ptr = data };
@@ -399,8 +432,11 @@ fn mapFile(allocator: std.mem.Allocator, f: std.fs.File, size: u64) !FileData {
 }
 
 fn unmapFile(allocator: std.mem.Allocator, fd: FileData) void {
+    _ = allocator;
     if (comptime builtin.os.tag == .windows) {
-        allocator.free(fd.ptr);
+        const w = std.os.windows;
+        _ = w.ntdll.NtUnmapViewOfSection(w.GetCurrentProcess(), @ptrFromInt(@intFromPtr(fd.ptr.ptr)));
+        w.CloseHandle(fd.section_handle);
     } else {
         std.posix.munmap(@alignCast(@constCast(fd.ptr)));
     }
