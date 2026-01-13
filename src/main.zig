@@ -1,6 +1,7 @@
 const std = @import("std");
 const opt = @import("core/opt.zig");
 const run = @import("run.zig");
+const ansi = @import("core/ansi.zig");
 
 const Options = struct {
     replace: ?[]const u8 = null,
@@ -14,6 +15,7 @@ const Options = struct {
     abs: bool = false,
     sort: bool = false,
     file_names: bool = false,
+    color: ansi.Color = .auto,
     include: opt.Multi([]const u8, 64) = .{},
     exclude: opt.Multi([]const u8, 64) = .{},
 
@@ -29,6 +31,7 @@ const Options = struct {
         .abs = .{ .help = "Print absolute paths" },
         .sort = .{ .help = "Sort output by path" },
         .file_names = .{ .short = 'f', .help = "Match against file names (not contents)" },
+        .color = .{ .help = "Colorize output (auto|always|never)" },
         .include = .{ .short = 'g', .help = "Only paths containing substring (repeatable)" },
         .exclude = .{ .short = 'x', .help = "Skip paths containing substring (repeatable)" },
     };

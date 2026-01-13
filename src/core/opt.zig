@@ -395,7 +395,7 @@ pub fn printUsage(comptime T: type, writer: anytype) void {
         writer.writeAll("\n") catch return;
     }
 
-    writer.writeAll("  -h, --help              Show this help\n") catch return;
+    writer.writeAll("  -h, --help                  Show this help\n") catch return;
 }
 
 fn typeName(comptime T: type) [:0]const u8 {

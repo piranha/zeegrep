@@ -1,5 +1,6 @@
 const std = @import("std");
 const pcre2 = @import("pcre2.zig");
+const ansi = @import("core/ansi.zig");
 
 pub const Pattern = union(enum) {
     literal: []const u8,
@@ -48,6 +49,13 @@ pub fn replaceAll(allocator: std.mem.Allocator, pat: *const Pattern, hay: []cons
             const rr = try pcre2.replaceAll(allocator, code, hay, repl);
             return .{ .out = rr.out, .n = rr.n };
         },
+    }
+}
+
+pub fn writeHighlighted(pat: *const Pattern, writer: anytype, hay: []const u8, ignore_case: bool) !void {
+    switch (pat.*) {
+        .literal => |needle| try writeHighlightedLiteral(writer, hay, needle, ignore_case),
+        .regex => |*code| try pcre2.writeHighlighted(code, writer, hay),
     }
 }
 
@@ -126,6 +134,23 @@ fn eqAsciiFold(a: []const u8, b: []const u8) bool {
         if (std.ascii.toLower(x) != std.ascii.toLower(y)) return false;
     }
     return true;
+}
+
+fn writeHighlightedLiteral(writer: anytype, hay: []const u8, needle: []const u8, ignore_case: bool) !void {
+    if (needle.len == 0) return writer.writeAll(hay);
+    var off: usize = 0;
+    while (off + needle.len <= hay.len) {
+        const idx = if (!ignore_case)
+            std.mem.indexOfPos(u8, hay, off, needle)
+        else
+            indexOfPosAsciiFold(hay, off, needle);
+        if (idx == null) break;
+        const i = idx.?;
+        try writer.writeAll(hay[off..i]);
+        try ansi.styled(true, .match, hay[i .. i + needle.len]).format(writer);
+        off = i + needle.len;
+    }
+    try writer.writeAll(hay[off..]);
 }
 
 test "literal vs regex detection" {

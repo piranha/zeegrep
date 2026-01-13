@@ -1,4 +1,5 @@
 const std = @import("std");
+const ansi = @import("core/ansi.zig");
 
 pub const c = @cImport({
     @cDefine("PCRE2_CODE_UNIT_WIDTH", "8");
@@ -80,6 +81,35 @@ pub fn countMatches(code: *const Code, subject: []const u8) usize {
         off = if (end > start) end else start + 1;
     }
     return n;
+}
+
+pub fn writeHighlighted(code: *const Code, writer: anytype, subject: []const u8) !void {
+    const md = c.pcre2_match_data_create_from_pattern_8(code.code.?, null) orelse return writer.writeAll(subject);
+    defer c.pcre2_match_data_free_8(md);
+
+    var off: usize = 0;
+    while (off <= subject.len) {
+        const rc = c.pcre2_match_8(
+            code.code.?,
+            subject.ptr,
+            subject.len,
+            off,
+            0,
+            md,
+            null,
+        );
+        if (rc < 0) break;
+        const ovec = c.pcre2_get_ovector_pointer_8(md);
+        const start: usize = @intCast(ovec[0]);
+        const end: usize = @intCast(ovec[1]);
+        if (start > subject.len or end > subject.len or end < start) break;
+
+        try writer.writeAll(subject[off..start]);
+        try writer.print("{f}", .{ansi.styled(true, .match, subject[start..end])});
+
+        off = if (end > start) end else start + 1;
+    }
+    if (off < subject.len) try writer.writeAll(subject[off..]);
 }
 
 pub const ReplaceResult = struct {
