@@ -2,31 +2,7 @@ const std = @import("std");
 const ignore = @import("ignore.zig");
 const glob = @import("glob.zig");
 
-pub fn collectFiles(
-    allocator: std.mem.Allocator,
-    cwd: std.fs.Dir,
-    ign: *ignore.Stack,
-    paths: []const []const u8,
-    include: []const []const u8,
-    exclude: []const []const u8,
-    hidden: bool,
-) ![][]const u8 {
-    var list: std.ArrayListUnmanaged([]const u8) = .{};
-    errdefer {
-        for (list.items) |p| allocator.free(p);
-        list.deinit(allocator);
-    }
-
-    if (paths.len == 0) {
-        try collectRoot(allocator, cwd, ign, &list, ".", include, exclude, hidden);
-    } else for (paths) |root| {
-        try collectRoot(allocator, cwd, ign, &list, root, include, exclude, hidden);
-    }
-
-    return try list.toOwnedSlice(allocator);
-}
-
-/// Walk files and call callback for each file (streaming, no collection)
+/// Walk files and call callback for each file (streaming)
 pub fn walkFiles(
     cwd: std.fs.Dir,
     ign: *ignore.Stack,
@@ -119,77 +95,6 @@ fn walkDir(
     }
 }
 
-fn collectRoot(
-    allocator: std.mem.Allocator,
-    cwd: std.fs.Dir,
-    ign: *ignore.Stack,
-    list: *std.ArrayListUnmanaged([]const u8),
-    root: []const u8,
-    include: []const []const u8,
-    exclude: []const []const u8,
-    hidden: bool,
-) !void {
-    const st = cwd.statFile(root) catch |e| switch (e) {
-        error.FileNotFound => return,
-        else => return e,
-    };
-
-    if (st.kind == .directory) {
-        const prefix = if (std.mem.eql(u8, root, ".") or std.mem.eql(u8, root, "./")) "" else root;
-        var d = try cwd.openDir(root, .{ .iterate = true });
-        defer d.close();
-        if (prefix.len != 0) {
-            try ign.pushDir(d, prefix);
-            defer ign.popDir();
-        }
-        try collectDir(allocator, cwd, ign, list, prefix, d, include, exclude, hidden);
-    } else {
-        if (!passesFile(root, include, exclude)) return;
-        if (ign.ignored(root, false, hidden)) return;
-        try list.append(allocator, try allocator.dupe(u8, root));
-    }
-}
-
-fn collectDir(
-    allocator: std.mem.Allocator,
-    cwd: std.fs.Dir,
-    ign: *ignore.Stack,
-    list: *std.ArrayListUnmanaged([]const u8),
-    prefix: []const u8,
-    dir: std.fs.Dir,
-    include: []const []const u8,
-    exclude: []const []const u8,
-    hidden: bool,
-) !void {
-    var it = dir.iterate();
-    while (try it.next()) |ent| {
-        const rel = if (prefix.len == 0)
-            try allocator.dupe(u8, ent.name)
-        else
-            try std.fs.path.join(allocator, &.{ prefix, ent.name });
-        defer allocator.free(rel);
-
-        if (ent.kind == .directory) {
-            if (excluded(rel, exclude)) continue;
-        } else {
-            if (!passesFile(rel, include, exclude)) continue;
-        }
-        if (ign.ignored(rel, ent.kind == .directory, hidden)) continue;
-
-        switch (ent.kind) {
-            .file => try list.append(allocator, try allocator.dupe(u8, rel)),
-            .directory => {
-                var sub = try cwd.openDir(rel, .{ .iterate = true });
-                defer sub.close();
-                try ign.pushDir(sub, rel);
-                defer ign.popDir();
-                try collectDir(allocator, cwd, ign, list, rel, sub, include, exclude, hidden);
-            },
-            else => {},
-        }
-    }
-}
-
 fn passesFile(path: []const u8, include: []const []const u8, exclude: []const []const u8) bool {
     if (excluded(path, exclude)) return false;
     if (include.len == 0) return true;
@@ -210,7 +115,7 @@ fn excluded(path: []const u8, exclude: []const []const u8) bool {
     return false;
 }
 
-test "collect files with include/exclude" {
+test "walk files with include/exclude" {
     var td = std.testing.tmpDir(.{});
     defer td.cleanup();
 
@@ -224,13 +129,27 @@ test "collect files with include/exclude" {
     try ign.pushDir(td.dir, "");
     defer ign.popDir();
 
-    const got = try collectFiles(std.testing.allocator, td.dir, &ign, &.{ "." }, &.{ "src" }, &.{ "test" }, false);
-    defer {
-        for (got) |p| std.testing.allocator.free(p);
-        std.testing.allocator.free(got);
-    }
-    try std.testing.expectEqual(@as(usize, 1), got.len);
-    try std.testing.expect(std.mem.endsWith(u8, got[0], "src/a.clj"));
+    const Collector = struct {
+        files: std.ArrayListUnmanaged([]const u8) = .{},
+        alloc: std.mem.Allocator,
+
+        pub fn onFile(self: *@This(), path: []const u8) void {
+            self.files.append(self.alloc, self.alloc.dupe(u8, path) catch return) catch {};
+        }
+
+        pub fn deinit(self: *@This()) void {
+            for (self.files.items) |p| self.alloc.free(p);
+            self.files.deinit(self.alloc);
+        }
+    };
+
+    var collector = Collector{ .alloc = std.testing.allocator };
+    defer collector.deinit();
+
+    try walkFiles(td.dir, &ign, &.{"."}, &.{"src"}, &.{"test"}, false, &collector);
+
+    try std.testing.expectEqual(@as(usize, 1), collector.files.items.len);
+    try std.testing.expect(std.mem.endsWith(u8, collector.files.items[0], "src/a.clj"));
 }
 
 test "include does not prune directories" {
@@ -245,11 +164,25 @@ test "include does not prune directories" {
     try ign.pushDir(td.dir, "");
     defer ign.popDir();
 
-    const got = try collectFiles(std.testing.allocator, td.dir, &ign, &.{ "." }, &.{ "run" }, &.{}, false);
-    defer {
-        for (got) |p| std.testing.allocator.free(p);
-        std.testing.allocator.free(got);
-    }
-    try std.testing.expectEqual(@as(usize, 1), got.len);
-    try std.testing.expect(std.mem.endsWith(u8, got[0], "src/run.zig"));
+    const Collector = struct {
+        files: std.ArrayListUnmanaged([]const u8) = .{},
+        alloc: std.mem.Allocator,
+
+        pub fn onFile(self: *@This(), path: []const u8) void {
+            self.files.append(self.alloc, self.alloc.dupe(u8, path) catch return) catch {};
+        }
+
+        pub fn deinit(self: *@This()) void {
+            for (self.files.items) |p| self.alloc.free(p);
+            self.files.deinit(self.alloc);
+        }
+    };
+
+    var collector = Collector{ .alloc = std.testing.allocator };
+    defer collector.deinit();
+
+    try walkFiles(td.dir, &ign, &.{"."}, &.{"run"}, &.{}, false, &collector);
+
+    try std.testing.expectEqual(@as(usize, 1), collector.files.items.len);
+    try std.testing.expect(std.mem.endsWith(u8, collector.files.items[0], "src/run.zig"));
 }
