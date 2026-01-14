@@ -54,7 +54,7 @@ pub const Stack = struct {
             const base = self.frames.items[r.frame].base;
             const target = r.target(rel_path, base) orelse continue;
 
-            if (!matchPat(r.pat, target, r.anchored or r.has_slash)) continue;
+            if (!matchPat(r.pat, r.kind, target, r.anchored or r.has_slash)) continue;
             ignored_ = !r.neg;
         }
         return ignored_;
@@ -104,6 +104,7 @@ pub const Stack = struct {
                 .dir_only = dir_only,
                 .anchored = anchored,
                 .has_slash = std.mem.indexOfScalar(u8, line, std.fs.path.sep) != null,
+                .kind = glob.classify(line),
             });
         }
     }
@@ -121,6 +122,7 @@ const Rule = struct {
     dir_only: bool,
     anchored: bool,
     has_slash: bool,
+    kind: glob.PatKind,
 
     fn target(self: Rule, rel_path: []const u8, base: []const u8) ?[]const u8 {
         _ = self;
@@ -133,12 +135,12 @@ const Rule = struct {
     }
 };
 
-fn matchPat(pat: []const u8, target: []const u8, full_path: bool) bool {
+fn matchPat(pat: []const u8, kind: glob.PatKind, target: []const u8, full_path: bool) bool {
     if (!full_path and std.mem.indexOfScalar(u8, pat, std.fs.path.sep) == null) {
         const base = std.fs.path.basename(target);
-        return glob.match(pat, base);
+        return glob.fastMatch(kind, pat, base);
     }
-    return glob.match(pat, target);
+    return glob.fastMatch(kind, pat, target);
 }
 
 fn defaultSkip(rel_path: []const u8) bool {

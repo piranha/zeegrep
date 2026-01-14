@@ -1,5 +1,30 @@
 const std = @import("std");
 
+pub const PatKind = enum { literal, ext_only, prefix, suffix, glob };
+
+pub fn classify(pat: []const u8) PatKind {
+    if (!isGlob(pat)) return .literal;
+    // *.foo - extension only
+    if (pat.len > 2 and pat[0] == '*' and pat[1] == '.' and
+        std.mem.indexOfAny(u8, pat[2..], "*?[") == null) return .ext_only;
+    // foo* - prefix match
+    if (pat[pat.len - 1] == '*' and
+        std.mem.indexOfAny(u8, pat[0 .. pat.len - 1], "*?[") == null) return .prefix;
+    // *foo - suffix match
+    if (pat[0] == '*' and std.mem.indexOfAny(u8, pat[1..], "*?[") == null) return .suffix;
+    return .glob;
+}
+
+pub fn fastMatch(kind: PatKind, pat: []const u8, s: []const u8) bool {
+    return switch (kind) {
+        .literal => std.mem.eql(u8, pat, s),
+        .ext_only => std.mem.endsWith(u8, s, pat[1..]), // *.foo -> .foo
+        .prefix => std.mem.startsWith(u8, s, pat[0 .. pat.len - 1]),
+        .suffix => std.mem.endsWith(u8, s, pat[1..]),
+        .glob => match(pat, s),
+    };
+}
+
 pub fn isGlob(pat: []const u8) bool {
     return std.mem.indexOfAny(u8, pat, "*?[") != null;
 }
@@ -130,6 +155,31 @@ fn classHas(body: []const u8, c: u8) bool {
         }
     }
     return if (neg) !ok else ok;
+}
+
+test "classify" {
+    try std.testing.expectEqual(PatKind.literal, classify("foo"));
+    try std.testing.expectEqual(PatKind.literal, classify("foo.bar"));
+    try std.testing.expectEqual(PatKind.ext_only, classify("*.log"));
+    try std.testing.expectEqual(PatKind.ext_only, classify("*.tar.gz"));
+    try std.testing.expectEqual(PatKind.prefix, classify("foo*"));
+    try std.testing.expectEqual(PatKind.prefix, classify("node_modules*"));
+    try std.testing.expectEqual(PatKind.suffix, classify("*_test"));
+    try std.testing.expectEqual(PatKind.glob, classify("*.log.*"));
+    try std.testing.expectEqual(PatKind.glob, classify("foo*bar"));
+    try std.testing.expectEqual(PatKind.glob, classify("**/*.zig"));
+    try std.testing.expectEqual(PatKind.glob, classify("src/*/test"));
+}
+
+test "fastMatch" {
+    try std.testing.expect(fastMatch(.literal, "foo", "foo"));
+    try std.testing.expect(!fastMatch(.literal, "foo", "bar"));
+    try std.testing.expect(fastMatch(.ext_only, "*.log", "test.log"));
+    try std.testing.expect(!fastMatch(.ext_only, "*.log", "test.txt"));
+    try std.testing.expect(fastMatch(.prefix, "foo*", "foobar"));
+    try std.testing.expect(!fastMatch(.prefix, "foo*", "barfoo"));
+    try std.testing.expect(fastMatch(.suffix, "*_test", "foo_test"));
+    try std.testing.expect(!fastMatch(.suffix, "*_test", "test_foo"));
 }
 
 test "glob basics" {
