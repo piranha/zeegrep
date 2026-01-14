@@ -1,4 +1,4 @@
-.PHONY: build test release clean ciall
+.PHONY: build test itest release clean ciall
 
 VERSION=dev
 
@@ -7,6 +7,9 @@ build:
 
 test:
 	zig build test
+
+itest: build
+	PATH="$$PWD/zig-out/bin:$$PATH" quizzig tests/*.t
 
 release:
 	zig build --release=fast

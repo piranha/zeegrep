@@ -404,7 +404,6 @@ pub fn printUsage(comptime T: type, writer: anytype) void {
     }
 
     writer.writeAll("  -h, --help                  Show this help\n") catch return;
-    writer.writeAll("  -V, --version               Show version\n") catch return;
 }
 
 fn typeName(comptime T: type) [:0]const u8 {
@@ -420,12 +419,11 @@ fn typeName(comptime T: type) [:0]const u8 {
     return "?";
 }
 
-/// Convenience: print to stderr
 pub fn usage(comptime T: type) void {
     var buf: [4096]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
     printUsage(T, fbs.writer());
-    std.fs.File.stderr().writeAll(fbs.getWritten()) catch {};
+    std.fs.File.stdout().writeAll(fbs.getWritten()) catch {};
 }
 
 /// Find subcommand name (first positional arg)
@@ -520,12 +518,12 @@ fn printFields(comptime T: type, writer: anytype) void {
     }
 }
 
-/// Convenience: print merged usage to stderr
+/// This is for subcommands
 pub fn mergedUsage(comptime G: type, comptime S: type) void {
     var buf: [4096]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
     printMergedUsage(G, S, fbs.writer());
-    std.fs.File.stderr().writeAll(fbs.getWritten()) catch {};
+    std.fs.File.stdout().writeAll(fbs.getWritten()) catch {};
 }
 
 // ============ Tests ============

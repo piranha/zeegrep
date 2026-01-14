@@ -4,6 +4,8 @@ const run = @import("run.zig");
 const ansi = @import("core/ansi.zig");
 const build_options = @import("build_options");
 
+const version = build_options.version;
+
 const Options = struct {
     replace: ?[]const u8 = null,
     dry_run: bool = false,
@@ -21,6 +23,7 @@ const Options = struct {
     color: ansi.Color = .auto,
     include: opt.Multi([]const u8, 64) = .{},
     exclude: opt.Multi([]const u8, 64) = .{},
+    version: bool = false,
 
     pub const meta = .{
         .replace = .{ .short = 'r', .help = "Replacement string (enables replace)" },
@@ -39,6 +42,7 @@ const Options = struct {
         .color = .{ .help = "Colorize output (auto|always|never)" },
         .include = .{ .short = 'g', .help = "Only paths containing substring (repeatable)" },
         .exclude = .{ .short = 'x', .help = "Skip paths containing substring (repeatable)" },
+        .version = .{ .short = 'V', .help = "Show version" },
     };
 
     pub const about = .{
@@ -74,12 +78,6 @@ pub fn main() !void {
         return;
     }
 
-    if (args.len == 1 and (std.mem.eql(u8, args[0], "--version") or std.mem.eql(u8, args[0], "-V"))) {
-        const stderr = std.fs.File.stderr().deprecatedWriter();
-        stderr.print("zeegrep {s}\n", .{build_options.version}) catch {};
-        return;
-    }
-
     var options = Options{};
     const rest = opt.parse(Options, &options, args) catch |e| switch (e) {
         error.Help => {
@@ -88,6 +86,11 @@ pub fn main() !void {
         },
         else => return e,
     };
+
+    if (options.version) {
+        std.debug.print("zeegrep {s}\n", .{version});
+        return;
+    }
 
     if (rest.len == 0) {
         opt.usage(Options);

@@ -199,7 +199,7 @@ fn Job(comptime Opts: type) type {
         }
 
         fn debugSkip(path: []const u8, reason: []const u8) void {
-            std.fs.File.stderr().deprecatedWriter().print("DEBUG: {s}: {s}\n", .{ path, reason }) catch {};
+            std.debug.print("DEBUG: {s}: {s}\n", .{ path, reason });
         }
 
         fn work(tmp: std.mem.Allocator, shared: *Shared, path: []const u8, options: Opts, pat: *const engine.Pattern) !void {

@@ -1,6 +1,7 @@
 .{
     .name = .zeegrep,
-    .version = "0.15.2",
+    // no idea how to sync this with tags used for releases
+    .version = "0.0.0",
     .dependencies = .{
         .pcre2 = .{
             .url = "git+https://github.com/PCRE2Project/pcre2?ref=pcre2-10.47#f454e231fe5006dd7ff8f4693fd2b8eb94333429",

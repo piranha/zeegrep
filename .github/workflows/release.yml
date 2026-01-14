@@ -22,8 +22,7 @@ jobs:
         run: zig build test
 
       - name: Build all targets
-        run: |
-          make ciall VERSION=${{ github.ref_name }}
+        run: make ciall VERSION=${{ github.ref_name }}
 
       - name: Create release
         uses: softprops/action-gh-release@v2
