@@ -4,7 +4,9 @@
 > — Protection.<br/>
 > — Protection from what, zee `sed`?
 
-Fast search and replace from your terminal. Like ripgrep, but actually replaces things. Use at your own risk.
+Fast search and replace from your terminal. Like ripgrep, but actually replaces things. Use at your own risk [^1].
+
+[^1]: zeegrep creates a new file when replacing and then atomically replaces the old file, which is widely accepted as the most safe way to change file contents and is probably what your code editor does. But this is also changing data, so YMMV.
 
 ## Why
 

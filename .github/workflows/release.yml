@@ -24,8 +24,11 @@ jobs:
       - name: Build all targets
         run: make ciall VERSION=${{ github.ref_name }}
 
+      - name: Get Release Notes
+        run: git tag -l --format='%(contents:body)' "$GITHUB_REF_NAME" > RELEASE_NOTES
+
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
           files: zig-out/dist/*
-          generate_release_notes: true
+          body_path: RELEASE_NOTES
