@@ -260,7 +260,7 @@ fn Job(comptime Opts: type) type {
                 shared.add(0, rr.n, true);
                 if (options.dry_run and !options.quiet) {
                     var buf: std.ArrayListUnmanaged(u8) = .{};
-                    _ = try diff.printChangedLines(buf.writer(tmp), shared.color, path, data, rr.out);
+                    _ = try diff.printChangedLines(buf.writer(tmp), shared.color, path, data, rr.out, shared.before, shared.after);
                     shared.output(path, buf.items);
                 }
                 return;

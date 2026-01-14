@@ -30,6 +30,7 @@ zg pattern -x test      # skip paths containing "test"
 - **Debugging** - Scientific method: write problem + hypotheses to `debug-<problem>.md`, design minimal experiments to falsify, track evidence, notice confusion, iterate.
 - **Ownership** - Don't abandon complex/tedious work. Pause only for contradictory requirements or critical blockers.
 - **Terseness** - Comments for surprising/hairy logic only. Be extremely concise in communication, sacrifice grammar.
+- **Adequacy** - Insults mean user expects better from you! Do not reply 'sorry', do better.
 - Address user by "Dude"
 
 ## Project Rules

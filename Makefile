@@ -7,9 +7,7 @@ build:
 
 test:
 	zig build test
-
-itest: build
-	PATH="$$PWD/zig-out/bin:$$PATH" quizzig tests/*.t
+	quizzig --bindir=zig-out/bin --indent=4 tests/*.md
 
 release:
 	zig build --release=fast
