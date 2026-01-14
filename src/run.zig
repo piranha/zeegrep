@@ -7,6 +7,67 @@ const core_atomic = @import("core/atomic.zig");
 const core_walk = @import("core/walk.zig");
 const core_ignore = @import("core/ignore.zig");
 const ansi = @import("core/ansi.zig");
+const opt = @import("core/opt.zig");
+
+pub const Options = struct {
+    replace: ?[]const u8 = null,
+    dry_run: bool = false,
+    ignore_case: bool = false,
+    multiline: bool = false,
+    context: u32 = 0,
+    after: u32 = 0,
+    before: u32 = 0,
+    quiet: bool = false,
+    count: bool = false,
+    abs: bool = false,
+    sort: bool = false,
+    file_names: bool = false,
+    hidden: bool = false,
+    debug: bool = false,
+    color: ansi.Color = .auto,
+    include: opt.Multi([]const u8, 64) = .{},
+    exclude: opt.Multi([]const u8, 64) = .{},
+    version: bool = false,
+
+    pub const meta = .{
+        .replace = .{ .short = 'r', .help = "Replacement string (enables replace)" },
+        .dry_run = .{ .short = 'n', .help = "Dry-run (show diff, no writes)" },
+        .ignore_case = .{ .short = 'i', .help = "Case-insensitive search" },
+        .multiline = .{ .short = 'M', .help = "Multiline mode (. matches newlines)" },
+        .context = .{ .short = 'C', .help = "Context lines" },
+        .after = .{ .short = 'A', .help = "Context lines after match" },
+        .before = .{ .short = 'B', .help = "Context lines before match" },
+        .quiet = .{ .short = 'q', .help = "Quiet (exit code only)" },
+        .count = .{ .help = "Only print match count" },
+        .abs = .{ .help = "Print absolute paths" },
+        .sort = .{ .help = "Sort output by path" },
+        .file_names = .{ .short = 'f', .help = "Match against file names (not contents)" },
+        .hidden = .{ .help = "Search hidden files and directories" },
+        .debug = .{ .help = "Show skipped files and reasons" },
+        .color = .{ .help = "Colorize output (auto|always|never)" },
+        .include = .{ .short = 'g', .help = "Only paths containing substring (repeatable)" },
+        .exclude = .{ .short = 'x', .help = "Skip paths containing substring (repeatable)" },
+        .version = .{ .short = 'V', .help = "Show version" },
+    };
+
+    pub const about = .{
+        .name = "zeegrep",
+        .desc = "zee search & replace tool",
+        .usage =
+        \\Usage: zg <pattern> [path] [options]
+        \\       zg <pattern> -r <replacement> [path] [options]
+        \\
+        \\Examples:
+        \\  zg pattern                 Search in current directory
+        \\  zg 'fn\s+\w+' src/         Regex search in specific path
+        \\  zg old -r new              Replace in-place
+        \\  zg old -r new -n           Dry-run, show diff
+        \\  zg 'foo(\d+)' -r 'bar$1'   Replace with capture groups
+        \\  zg pattern -x test -g clj  Filter paths by substring
+        \\
+        ,
+    };
+};
 
 pub fn run(allocator: std.mem.Allocator, writer: anytype, options: anytype, pattern: []const u8, paths: []const []const u8) !void {
     const cwd = std.fs.cwd();
@@ -547,27 +608,7 @@ test "search and replace tmpdir" {
     const b = try std.fmt.bufPrint(&pbuf, "{s}/b.txt", .{root});
     try cwd.writeFile(.{ .sub_path = b, .data = "nope\n" });
 
-    const Opt = struct {
-        replace: ?[]const u8 = null,
-        dry_run: bool = false,
-        ignore_case: bool = false,
-        multiline: bool = false,
-        context: u32 = 0,
-        after: u32 = 0,
-        before: u32 = 0,
-        quiet: bool = false,
-        count: bool = false,
-        abs: bool = false,
-        sort: bool = true,
-        file_names: bool = false,
-        hidden: bool = false,
-        debug: bool = false,
-        color: ansi.Color = .never,
-        include: @import("core/opt.zig").Multi([]const u8, 8) = .{},
-        exclude: @import("core/opt.zig").Multi([]const u8, 8) = .{},
-    };
-
-    var o = Opt{};
+    var o = Options{ .sort = true, .color = .never };
     try o.include.append(".txt");
 
     var buf: [2048]u8 = undefined;
