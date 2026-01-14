@@ -12,8 +12,8 @@ pub fn printChangedLines(
     ctx_before: usize,
     ctx_after: usize,
 ) !usize {
-    const old_lines = lineSlices(old);
-    const new_lines = lineSlices(new);
+    const old_lines = try lineSlices(old);
+    const new_lines = try lineSlices(new);
 
     // Same line count: show each differing line as separate hunk
     if (old_lines.len == new_lines.len) {
@@ -112,11 +112,11 @@ fn printHunk(
 
 /// Split content into lines, returning slices into the original data.
 /// Uses a fixed-size buffer to avoid allocation.
-fn lineSlices(data: []const u8) LineSlices {
+fn lineSlices(data: []const u8) error{FileTooLarge}!LineSlices {
     var result = LineSlices{};
     var it = std.mem.splitScalar(u8, data, '\n');
     while (it.next()) |line| {
-        if (result.len >= result.buf.len) break;
+        if (result.len >= result.buf.len) return error.FileTooLarge;
         result.buf[result.len] = line;
         result.len += 1;
     }
