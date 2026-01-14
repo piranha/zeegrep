@@ -15,12 +15,13 @@ pub const Code = struct {
     }
 };
 
-pub fn compile(allocator: std.mem.Allocator, pattern: []const u8, ignore_case: bool) !Code {
+pub fn compile(allocator: std.mem.Allocator, pattern: []const u8, ignore_case: bool, dotall: bool) !Code {
     var err_code: c_int = 0;
     var err_off: c.PCRE2_SIZE = 0;
 
     var opts: c_uint = c.PCRE2_MULTILINE;
     if (ignore_case) opts |= c.PCRE2_CASELESS;
+    if (dotall) opts |= c.PCRE2_DOTALL;
 
     const code = c.pcre2_compile_8(
         pattern.ptr,
@@ -81,6 +82,70 @@ pub fn countMatches(code: *const Code, subject: []const u8) usize {
         off = if (end > start) end else start + 1;
     }
     return n;
+}
+
+pub const Span = struct { start: usize, end: usize };
+
+pub const MatchIterator = struct {
+    code: *const Code,
+    subject: []const u8,
+    md: ?*c.pcre2_match_data_8,
+    pos: usize = 0,
+
+    pub fn init(code: *const Code, subject: []const u8) MatchIterator {
+        return .{
+            .code = code,
+            .subject = subject,
+            .md = c.pcre2_match_data_create_from_pattern_8(code.code.?, null),
+        };
+    }
+
+    pub fn deinit(self: *MatchIterator) void {
+        if (self.md) |md| c.pcre2_match_data_free_8(md);
+        self.md = null;
+    }
+
+    pub fn next(self: *MatchIterator) ?Span {
+        const md = self.md orelse return null;
+        if (self.pos > self.subject.len) return null;
+
+        const rc = c.pcre2_match_8(
+            self.code.code.?,
+            self.subject.ptr,
+            self.subject.len,
+            self.pos,
+            0,
+            md,
+            null,
+        );
+        if (rc < 0) return null;
+
+        const ovec = c.pcre2_get_ovector_pointer_8(md);
+        const start: usize = @intCast(ovec[0]);
+        const end: usize = @intCast(ovec[1]);
+        self.pos = if (end > start) end else start + 1;
+        return .{ .start = start, .end = end };
+    }
+};
+
+pub fn findMatches(allocator: std.mem.Allocator, code: *const Code, subject: []const u8) ![]Span {
+    const md = c.pcre2_match_data_create_from_pattern_8(code.code.?, null) orelse return error.OutOfMemory;
+    defer c.pcre2_match_data_free_8(md);
+
+    var spans: std.ArrayListUnmanaged(Span) = .{};
+    errdefer spans.deinit(allocator);
+
+    var off: usize = 0;
+    while (off <= subject.len) {
+        const rc = c.pcre2_match_8(code.code.?, subject.ptr, subject.len, off, 0, md, null);
+        if (rc < 0) break;
+        const ovec = c.pcre2_get_ovector_pointer_8(md);
+        const start: usize = @intCast(ovec[0]);
+        const end: usize = @intCast(ovec[1]);
+        try spans.append(allocator, .{ .start = start, .end = end });
+        off = if (end > start) end else start + 1;
+    }
+    return spans.toOwnedSlice(allocator);
 }
 
 pub fn writeHighlighted(on: bool, code: *const Code, writer: anytype, subject: []const u8) !void {
@@ -189,7 +254,7 @@ fn shrink(allocator: std.mem.Allocator, buf: []u8, used: usize) ![]u8 {
 }
 
 test "pcre2 replace and count" {
-    var code = try compile(std.testing.allocator, "foo(\\d+)", false);
+    var code = try compile(std.testing.allocator, "foo(\\d+)", false, false);
     defer code.deinit();
 
     try std.testing.expect(matchAny(&code, "xx foo123 yy"));
@@ -200,3 +265,4 @@ test "pcre2 replace and count" {
     try std.testing.expectEqual(@as(usize, 2), rr.n);
     try std.testing.expectEqualStrings("bar12 bar bar34", rr.out);
 }
+

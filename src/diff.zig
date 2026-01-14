@@ -1,115 +1,142 @@
 const std = @import("std");
 const ansi = @import("core/ansi.zig");
 
-const Line = struct {
-    old: []const u8,
-    new: []const u8,
-    changed: bool,
-};
-
+/// Print diff showing changed regions as separate hunks.
+/// Returns number of replacement operations.
 pub fn printChangedLines(
     writer: anytype,
     color: bool,
     path: []const u8,
     old: []const u8,
     new: []const u8,
-    before: usize,
-    after: usize,
+    ctx_before: usize,
+    ctx_after: usize,
 ) !usize {
-    // Collect all lines
-    var lines: [4096]Line = undefined;
-    var total: usize = 0;
-    var n_changes: usize = 0;
+    const old_lines = lineSlices(old);
+    const new_lines = lineSlices(new);
 
-    var it_old = std.mem.splitScalar(u8, old, '\n');
-    var it_new = std.mem.splitScalar(u8, new, '\n');
-
-    while (true) {
-        const o = it_old.next();
-        const nn = it_new.next();
-        if (o == null and nn == null) break;
-        if (total >= lines.len) break;
-        const ol = o orelse "";
-        const nl = nn orelse "";
-        const changed = !std.mem.eql(u8, ol, nl);
-        if (changed) n_changes += 1;
-        lines[total] = .{ .old = ol, .new = nl, .changed = changed };
-        total += 1;
-    }
-
-    if (n_changes == 0) return 0;
-
-    // Find hunks (groups of changes with context, coalesced if overlapping)
-    var hunk_start: usize = 0;
-    var hunk_end: usize = 0;
-    var in_hunk = false;
-
-    var i: usize = 0;
-    while (i < total) : (i += 1) {
-        if (!lines[i].changed) continue;
-
-        const ctx_start = if (i >= before) i - before else 0;
-        const ctx_end = @min(i + after + 1, total);
-
-        if (!in_hunk) {
-            // Start new hunk
-            hunk_start = ctx_start;
-            hunk_end = ctx_end;
-            in_hunk = true;
-        } else if (ctx_start <= hunk_end) {
-            // Overlaps/touches current hunk, extend it
-            hunk_end = ctx_end;
-        } else {
-            // Gap - print current hunk, start new one
-            try printHunk(writer, color, path, lines[0..total], hunk_start, hunk_end, before > 0 or after > 0);
-            hunk_start = ctx_start;
-            hunk_end = ctx_end;
+    // Same line count: show each differing line as separate hunk
+    if (old_lines.len == new_lines.len) {
+        var n: usize = 0;
+        var i: usize = 0;
+        while (i < old_lines.len) {
+            if (!std.mem.eql(u8, old_lines.items()[i], new_lines.items()[i])) {
+                // Find end of contiguous change
+                var end = i + 1;
+                while (end < old_lines.len and
+                    !std.mem.eql(u8, old_lines.items()[end], new_lines.items()[end]))
+                {
+                    end += 1;
+                }
+                try printHunk(writer, color, path, old_lines, new_lines, i, end, i, end, ctx_before, ctx_after);
+                n += 1;
+                i = end;
+            } else {
+                i += 1;
+            }
         }
+        return n;
     }
 
-    // Print final hunk
-    if (in_hunk) {
-        try printHunk(writer, color, path, lines[0..total], hunk_start, hunk_end, before > 0 or after > 0);
+    // Different line counts: find changed region
+    var first_diff: usize = 0;
+    while (first_diff < old_lines.len and first_diff < new_lines.len and
+        std.mem.eql(u8, old_lines.items()[first_diff], new_lines.items()[first_diff]))
+    {
+        first_diff += 1;
     }
 
-    return n_changes;
+    if (first_diff == old_lines.len and first_diff == new_lines.len) return 0;
+
+    var old_end = old_lines.len;
+    var new_end = new_lines.len;
+    while (old_end > first_diff and new_end > first_diff and
+        std.mem.eql(u8, old_lines.items()[old_end - 1], new_lines.items()[new_end - 1]))
+    {
+        old_end -= 1;
+        new_end -= 1;
+    }
+
+    try printHunk(writer, color, path, old_lines, new_lines, first_diff, old_end, first_diff, new_end, ctx_before, ctx_after);
+    return 1;
 }
 
-fn printHunk(writer: anytype, color: bool, path: []const u8, lines: []const Line, start: usize, end: usize, has_context: bool) !void {
-    // Header with line range (1-indexed)
-    const first = start + 1;
-    const last = end; // end is exclusive, so last line is end
+fn printHunk(
+    writer: anytype,
+    color: bool,
+    path: []const u8,
+    old_lines: LineSlices,
+    new_lines: LineSlices,
+    old_start: usize,
+    old_end: usize,
+    new_start: usize,
+    new_end: usize,
+    ctx_before: usize,
+    ctx_after: usize,
+) !void {
+    const ctx_start = if (old_start >= ctx_before) old_start - ctx_before else 0;
+    const ctx_end_old = @min(old_end + ctx_after, old_lines.len);
+    const ctx_end_new = @min(new_end + ctx_after, new_lines.len);
+
+    // Header
+    const first = ctx_start + 1;
+    const last = ctx_end_old;
     if (first == last) {
         try writer.print("── {f}:{f} ──\n", .{ ansi.styled(color, .path, path), ansi.styled(color, .heading, first) });
     } else {
         try writer.print("── {f}:{f}-{f} ──\n", .{ ansi.styled(color, .path, path), ansi.styled(color, .heading, first), ansi.styled(color, .heading, last) });
     }
 
-    _ = has_context;
-    const hunk = lines[start..end];
-    var i: usize = 0;
-    while (i < hunk.len) {
-        if (!hunk[i].changed) {
-            // Context line
-            try writer.print("  {s}\n", .{hunk[i].old});
-            i += 1;
-        } else {
-            // Find run of consecutive changes
-            const run_start = i;
-            while (i < hunk.len and hunk[i].changed) : (i += 1) {}
-            // Print all deletions
-            for (hunk[run_start..i]) |line| {
-                try writer.print("{f} {f}\n", .{ ansi.styled(color, .del, "-"), ansi.styled(color, .del, line.old) });
-            }
-            // Print all additions
-            for (hunk[run_start..i]) |line| {
-                try writer.print("{f} {f}\n", .{ ansi.styled(color, .add, "+"), ansi.styled(color, .add, line.new) });
-            }
+    // Context before
+    for (old_lines.items()[ctx_start..old_start]) |line| {
+        try writer.print("  {s}\n", .{line});
+    }
+
+    // Deletions
+    for (old_lines.items()[old_start..old_end]) |line| {
+        try writer.print("{f} {f}\n", .{ ansi.styled(color, .del, "-"), ansi.styled(color, .del, line) });
+    }
+
+    // Additions
+    for (new_lines.items()[new_start..new_end]) |line| {
+        try writer.print("{f} {f}\n", .{ ansi.styled(color, .add, "+"), ansi.styled(color, .add, line) });
+    }
+
+    // Context after
+    if (ctx_end_new > new_end) {
+        for (new_lines.items()[new_end..ctx_end_new]) |line| {
+            try writer.print("  {s}\n", .{line});
         }
     }
 }
 
-test "diff prints only changed lines" {
+/// Split content into lines, returning slices into the original data.
+/// Uses a fixed-size buffer to avoid allocation.
+fn lineSlices(data: []const u8) LineSlices {
+    var result = LineSlices{};
+    var it = std.mem.splitScalar(u8, data, '\n');
+    while (it.next()) |line| {
+        if (result.len >= result.buf.len) break;
+        result.buf[result.len] = line;
+        result.len += 1;
+    }
+    // Remove trailing empty line (artifact of trailing newline)
+    if (result.len > 0 and result.buf[result.len - 1].len == 0) {
+        result.len -= 1;
+    }
+    return result;
+}
+
+const LineSlices = struct {
+    buf: [4096][]const u8 = undefined,
+    len: usize = 0,
+
+    fn items(self: *const LineSlices) []const []const u8 {
+        return self.buf[0..self.len];
+    }
+};
+
+test "diff simple line change" {
     var buf: [256]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
     const n = try printChangedLines(fbs.writer(), false, "x.txt", "a\nb\nc\n", "a\nbb\nc\n", 0, 0);
@@ -120,14 +147,40 @@ test "diff prints only changed lines" {
     try std.testing.expect(std.mem.indexOf(u8, s, "+ bb") != null);
 }
 
-test "diff groups consecutive changes no context" {
+test "diff multiline to single line" {
     var buf: [512]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
-    const n = try printChangedLines(fbs.writer(), false, "x.txt", "a\nb\nc\nd\n", "a\nB\nC\nd\n", 0, 0);
-    try std.testing.expectEqual(@as(usize, 2), n);
+    // Replace 3 lines with 1 line
+    const n = try printChangedLines(fbs.writer(), false, "x.txt", "a\nb\nc\nd\n", "a\nX\nd\n", 0, 0);
+    try std.testing.expectEqual(@as(usize, 1), n);
     const s = fbs.getWritten();
-    // Should have single header for lines 2-3
-    try std.testing.expect(std.mem.indexOf(u8, s, "x.txt:2-3") != null);
+
+    const expected =
+        \\── x.txt:2-3 ──
+        \\- b
+        \\- c
+        \\+ X
+        \\
+    ;
+    try std.testing.expectEqualStrings(expected, s);
+}
+
+test "diff single line to multiline" {
+    var buf: [512]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    // Replace 1 line with 3 lines
+    const n = try printChangedLines(fbs.writer(), false, "x.txt", "a\nX\nd\n", "a\nb\nc\nd\n", 0, 0);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    const s = fbs.getWritten();
+
+    const expected =
+        \\── x.txt:2 ──
+        \\- X
+        \\+ b
+        \\+ c
+        \\
+    ;
+    try std.testing.expectEqualStrings(expected, s);
 }
 
 test "diff with context" {
@@ -136,52 +189,45 @@ test "diff with context" {
     const n = try printChangedLines(fbs.writer(), false, "x.txt", "1\n2\n3\n4\n5\n", "1\n2\nX\n4\n5\n", 1, 1);
     try std.testing.expectEqual(@as(usize, 1), n);
     const s = fbs.getWritten();
-    // Should show context lines 2 and 4
-    try std.testing.expect(std.mem.indexOf(u8, s, "  2") != null);
-    try std.testing.expect(std.mem.indexOf(u8, s, "  4") != null);
-}
 
-test "diff groups consecutive changes" {
-    var buf: [1024]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    // Lines 2,3 change (consecutive) - should group deletions then additions
-    const n = try printChangedLines(fbs.writer(), false, "x.txt", "1\n2\n3\n4\n", "1\nA\nB\n4\n", 1, 1);
-    try std.testing.expectEqual(@as(usize, 2), n);
-    const s = fbs.getWritten();
-
-    // Consecutive changes: all deletions, then all additions
     const expected =
-        \\── x.txt:1-4 ──
-        \\  1
-        \\- 2
+        \\── x.txt:2-4 ──
+        \\  2
         \\- 3
-        \\+ A
-        \\+ B
+        \\+ X
         \\  4
         \\
     ;
     try std.testing.expectEqualStrings(expected, s);
 }
 
-test "diff separates non-consecutive changes with context" {
+test "diff multiline replacement with context" {
     var buf: [1024]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
-    // Lines 2 and 4 change (non-consecutive) - context line 3 separates them
-    const n = try printChangedLines(fbs.writer(), false, "x.txt", "1\n2\n3\n4\n5\n", "1\nA\n3\nB\n5\n", 1, 1);
-    try std.testing.expectEqual(@as(usize, 2), n);
+    // old has 3 lines that become 1, with context
+    const old = "header\nold {\n    body\n}\nfooter\n";
+    const new = "header\nnew { updated }\nfooter\n";
+    const n = try printChangedLines(fbs.writer(), false, "x.txt", old, new, 1, 1);
+    try std.testing.expectEqual(@as(usize, 1), n);
     const s = fbs.getWritten();
 
-    // Non-consecutive: context separates the change groups
     const expected =
         \\── x.txt:1-5 ──
-        \\  1
-        \\- 2
-        \\+ A
-        \\  3
-        \\- 4
-        \\+ B
-        \\  5
+        \\  header
+        \\- old {
+        \\-     body
+        \\- }
+        \\+ new { updated }
+        \\  footer
         \\
     ;
     try std.testing.expectEqualStrings(expected, s);
+}
+
+test "diff no change" {
+    var buf: [256]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    const n = try printChangedLines(fbs.writer(), false, "x.txt", "same\n", "same\n", 0, 0);
+    try std.testing.expectEqual(@as(usize, 0), n);
+    try std.testing.expectEqual(@as(usize, 0), fbs.getWritten().len);
 }

@@ -5,7 +5,7 @@ build:
 
 test:
 	zig build test
-	quizzig --bindir=zig-out/bin --indent=4 tests/*.md
+	quizzig --bindir=zig-out/bin tests/*.md
 
 release:
 	zig build --release=fast

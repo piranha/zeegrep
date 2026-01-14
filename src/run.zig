@@ -13,7 +13,13 @@ pub fn run(allocator: std.mem.Allocator, writer: anytype, options: anytype, patt
 
     if (options.file_names and options.replace != null) return error.InvalidArgs;
 
-    var pat = try engine.compile(allocator, pattern, options.ignore_case);
+    // Interpret escape sequences in pattern and replacement
+    const processed_pattern = try engine.interpretEscapes(allocator, pattern);
+    defer allocator.free(processed_pattern);
+    const processed_replace = if (options.replace) |r| try engine.interpretEscapes(allocator, r) else null;
+    defer if (processed_replace) |r| allocator.free(r);
+
+    var pat = try engine.compile(allocator, processed_pattern, options.ignore_case, options.multiline);
     defer pat.deinit();
 
     const before: u32 = if (options.context > 0) options.context else options.before;
@@ -33,7 +39,7 @@ pub fn run(allocator: std.mem.Allocator, writer: anytype, options: anytype, patt
     const use_color = ansi.enabled(options.color, is_tty, no_color != null);
     const use_heading = is_tty and options.replace == null and !options.quiet and !options.count and !options.file_names and isMultiPathSearch(cwd, paths);
 
-    var shared = Shared.init(shared_alloc, before, after, use_color, use_heading, options.sort, writer.any());
+    var shared = Shared.init(shared_alloc, before, after, use_color, use_heading, options.sort, processed_replace, writer.any());
     defer shared.deinit();
 
     var scope = pool.scope();
@@ -125,6 +131,7 @@ const Shared = struct {
     color: bool,
     heading: bool,
     sort: bool,
+    replace: ?[]const u8,
     writer: std.io.AnyWriter,
 
     mu: std.Thread.Mutex = .{},
@@ -136,8 +143,8 @@ const Shared = struct {
     files_changed: usize = 0,
     had_error: bool = false,
 
-    fn init(allocator: std.mem.Allocator, before: u32, after: u32, color: bool, heading: bool, sort: bool, writer: std.io.AnyWriter) Shared {
-        return .{ .allocator = allocator, .before = before, .after = after, .color = color, .heading = heading, .sort = sort, .writer = writer };
+    fn init(allocator: std.mem.Allocator, before: u32, after: u32, color: bool, heading: bool, sort: bool, replace: ?[]const u8, writer: std.io.AnyWriter) Shared {
+        return .{ .allocator = allocator, .before = before, .after = after, .color = color, .heading = heading, .sort = sort, .replace = replace, .writer = writer };
     }
 
     fn deinit(self: *Shared) void {
@@ -251,7 +258,7 @@ fn Job(comptime Opts: type) type {
                 return;
             }
 
-            if (options.replace) |repl| {
+            if (shared.replace) |repl| {
                 const rr = try engine.replaceAll(tmp, pat, data, repl, options.ignore_case);
                 if (rr.n == 0) return;
 
@@ -266,79 +273,121 @@ fn Job(comptime Opts: type) type {
                 return;
             }
 
-            // Fast path: no context, stream output directly
-            if (shared.before == 0 and shared.after == 0) {
-                var out: std.ArrayListUnmanaged(u8) = .{};
-                const w = out.writer(tmp);
+            // Context lines: use line-based approach
+            if (shared.before > 0 or shared.after > 0) {
+                try searchWithContext(tmp, shared, path, data, pat, options);
+                return;
+            }
 
-                var matches: usize = 0;
-                var line_no: usize = 1;
-                var it = std.mem.splitScalar(u8, data, '\n');
-                var wrote_heading = false;
+            // Whole-file matching with iterator (zero allocation)
+            var matches: usize = 0;
+            var out: std.ArrayListUnmanaged(u8) = .{};
+            const w = out.writer(tmp);
+            var wrote_heading = false;
+            var last_end_line: ?usize = null;
 
-                while (it.next()) |ln| : (line_no += 1) {
-                    const n = engine.countMatches(pat, ln, options.ignore_case);
-                    if (n == 0) continue;
-                    matches += n;
+            var it = engine.MatchIterator.init(pat, data);
+            defer it.deinit();
 
-                    if (options.quiet) continue;
-                    if (options.count) continue;
+            // Incremental line tracking to avoid O(n) offsetToLine calls
+            var line_tracker = LineTracker{};
 
+            while (it.next()) |span| {
+                matches += 1;
+                const start_line = line_tracker.lineAt(data, span.start);
+                // Skip output if we already output this line (but still count)
+                if (last_end_line != null and start_line <= last_end_line.?) continue;
+
+                if (options.quiet or options.count) {
+                    last_end_line = start_line;
+                    continue;
+                }
+
+                const match_text = data[span.start..span.end];
+                const is_multiline_match = std.mem.indexOfScalar(u8, match_text, '\n') != null;
+
+                if (is_multiline_match) {
+                    const end_line = line_tracker.lineAt(data, span.end);
+                    if (last_end_line != null and start_line > last_end_line.? + 1)
+                        try w.print("{f}\n", .{ansi.styled(shared.color, .dim, "--")});
+                    try w.print("{f} {f}:{f}-{f} {f}\n", .{
+                        ansi.styled(shared.color, .dim, "──"),
+                        ansi.styled(shared.color, .path, path),
+                        ansi.styled(shared.color, .line_no, start_line),
+                        ansi.styled(shared.color, .line_no, end_line),
+                        ansi.styled(shared.color, .dim, "──"),
+                    });
+                    const block_start = lineStartEnd(data, span.start).start;
+                    const block_end = lineStartEnd(data, if (span.end > 0) span.end - 1 else 0).end;
+                    var line_start = block_start;
+                    var cur_line = start_line;
+                    while (line_start <= block_end) {
+                        const le = lineStartEnd(data, line_start);
+                        try w.print("{f}│ ", .{ansi.styled(shared.color, .line_no, cur_line)});
+                        if (line_start >= span.start and le.end <= span.end) {
+                            try w.print("{f}", .{ansi.styled(shared.color, .match, data[line_start..le.end])});
+                        } else if (span.start > line_start and span.start < le.end) {
+                            try w.writeAll(data[line_start..span.start]);
+                            try w.print("{f}", .{ansi.styled(shared.color, .match, data[span.start..@min(span.end, le.end)])});
+                            if (span.end < le.end) try w.writeAll(data[span.end..le.end]);
+                        } else if (span.end > line_start and span.end <= le.end) {
+                            try w.print("{f}", .{ansi.styled(shared.color, .match, data[line_start..span.end])});
+                            try w.writeAll(data[span.end..le.end]);
+                        } else try w.writeAll(data[line_start..le.end]);
+                        try w.writeByte('\n');
+                        cur_line += 1;
+                        line_start = le.end + 1;
+                    }
+                    last_end_line = end_line;
+                } else {
+                    const le = lineStartEnd(data, span.start);
+                    if (last_end_line != null and start_line > last_end_line.? + 1)
+                        try w.print("{f}\n", .{ansi.styled(shared.color, .dim, "--")});
                     if (shared.heading and !wrote_heading) {
                         try w.print("{f}\n", .{ansi.styled(shared.color, .path, path)});
                         wrote_heading = true;
                     }
-                    if (!shared.heading) {
-                        try w.print("{f}:", .{ansi.styled(shared.color, .path, path)});
-                    }
-                    try w.print("{f}:", .{ansi.styled(shared.color, .line_no, line_no)});
-                    try engine.writeHighlighted(shared.color, pat, w, ln, options.ignore_case);
+                    if (!shared.heading) try w.print("{f}:", .{ansi.styled(shared.color, .path, path)});
+                    try w.print("{f}:", .{ansi.styled(shared.color, .line_no, start_line)});
+                    try engine.writeHighlighted(shared.color, pat, w, data[le.start..le.end], options.ignore_case);
                     try w.writeByte('\n');
+                    last_end_line = start_line;
                 }
-
-                if (matches == 0) return;
-                shared.add(matches, 0, false);
-
-                if (options.count and !options.quiet) {
-                    try w.print("{f}:{f}\n", .{ ansi.styled(shared.color, .path, path), ansi.styled(shared.color, .line_no, matches) });
-                }
-                if (!options.quiet and out.items.len > 0) {
-                    shared.output(path, out.items);
-                }
-                return;
             }
+            if (matches == 0) return;
+            shared.add(matches, 0, false);
+            if (options.count and !options.quiet)
+                try w.print("{f}:{f}\n", .{ ansi.styled(shared.color, .path, path), ansi.styled(shared.color, .line_no, matches) });
+            if (!options.quiet and out.items.len > 0) shared.output(path, out.items);
+        }
 
-            // Slow path: context lines needed
+        fn searchWithContext(tmp: std.mem.Allocator, shared: *Shared, path: []const u8, data: []const u8, pat: *const engine.Pattern, options: Opts) !void {
+            // Context lines needed
             const lines = try splitLines(tmp, data);
-
             const emit = try tmp.alloc(bool, lines.len);
             @memset(emit, false);
-
             const is_match = try tmp.alloc(bool, lines.len);
             @memset(is_match, false);
 
             var matches: usize = 0;
-            for (lines, 0..) |ln, i| {
+            for (lines, 0..) |ln, idx| {
                 const n = engine.countMatches(pat, ln, options.ignore_case);
                 if (n == 0) continue;
-                is_match[i] = true;
+                is_match[idx] = true;
                 matches += n;
-
-                const lo: usize = if (shared.before > i) 0 else i - shared.before;
-                var hi: usize = i + shared.after;
+                const lo: usize = if (shared.before > idx) 0 else idx - shared.before;
+                var hi: usize = idx + shared.after;
                 if (hi >= lines.len) hi = lines.len - 1;
                 var j: usize = lo;
                 while (j <= hi) : (j += 1) emit[j] = true;
             }
-
             if (matches == 0) return;
             shared.add(matches, 0, false);
 
             if (options.count) {
                 if (options.quiet) return;
                 var buf: std.ArrayListUnmanaged(u8) = .{};
-                const w = buf.writer(tmp);
-                try w.print("{f}:{f}\n", .{ ansi.styled(shared.color, .path, path), ansi.styled(shared.color, .line_no, matches) });
+                try buf.writer(tmp).print("{f}:{f}\n", .{ ansi.styled(shared.color, .path, path), ansi.styled(shared.color, .line_no, matches) });
                 shared.output(path, buf.items);
                 return;
             }
@@ -346,27 +395,16 @@ fn Job(comptime Opts: type) type {
 
             var out: std.ArrayListUnmanaged(u8) = .{};
             const w = out.writer(tmp);
-
             var last: ?usize = null;
-            if (shared.heading) {
-                try w.print("{f}\n", .{ansi.styled(shared.color, .path, path)});
-            }
-            for (lines, 0..) |ln, i| {
-                if (!emit[i]) continue;
-
-                if (last != null and i > last.? + 1) {
-                    try w.print("{f}\n", .{ansi.styled(shared.color, .dim, "--")});
-                }
-                last = i;
-
-                const sep: u8 = if (is_match[i]) ':' else '-';
-
-                if (!shared.heading) {
-                    try w.print("{f}{c}", .{ ansi.styled(shared.color, .path, path), sep });
-                }
-                try w.print("{f}{c}", .{ ansi.styled(shared.color, .line_no, i + 1), sep });
-
-                if (is_match[i]) try engine.writeHighlighted(shared.color, pat, w, ln, options.ignore_case) else try w.writeAll(ln);
+            if (shared.heading) try w.print("{f}\n", .{ansi.styled(shared.color, .path, path)});
+            for (lines, 0..) |ln, idx| {
+                if (!emit[idx]) continue;
+                if (last != null and idx > last.? + 1) try w.print("{f}\n", .{ansi.styled(shared.color, .dim, "--")});
+                last = idx;
+                const sep: u8 = if (is_match[idx]) ':' else '-';
+                if (!shared.heading) try w.print("{f}{c}", .{ ansi.styled(shared.color, .path, path), sep });
+                try w.print("{f}{c}", .{ ansi.styled(shared.color, .line_no, idx + 1), sep });
+                if (is_match[idx]) try engine.writeHighlighted(shared.color, pat, w, ln, options.ignore_case) else try w.writeAll(ln);
                 try w.writeByte('\n');
             }
             shared.output(path, out.items);
@@ -380,6 +418,46 @@ fn splitLines(allocator: std.mem.Allocator, data: []const u8) ![]const []const u
     var it = std.mem.splitScalar(u8, data, '\n');
     while (it.next()) |line| try list.append(allocator, line);
     return try list.toOwnedSlice(allocator);
+}
+
+fn offsetToLine(data: []const u8, offset: usize) usize {
+    var line: usize = 1;
+    for (data[0..@min(offset, data.len)]) |c| {
+        if (c == '\n') line += 1;
+    }
+    return line;
+}
+
+// Incremental line tracker - O(delta) instead of O(n) for sequential offsets
+const LineTracker = struct {
+    pos: usize = 0,
+    line: usize = 1,
+
+    fn lineAt(self: *LineTracker, data: []const u8, offset: usize) usize {
+        if (offset >= self.pos) {
+            // Forward scan from current position
+            for (data[self.pos..@min(offset, data.len)]) |c| {
+                if (c == '\n') self.line += 1;
+            }
+        } else {
+            // Backward scan (rare, but handle it)
+            var i = self.pos;
+            while (i > offset) {
+                i -= 1;
+                if (data[i] == '\n') self.line -= 1;
+            }
+        }
+        self.pos = offset;
+        return self.line;
+    }
+};
+
+fn lineStartEnd(data: []const u8, offset: usize) struct { start: usize, end: usize } {
+    var start = offset;
+    while (start > 0 and data[start - 1] != '\n') start -= 1;
+    var end = offset;
+    while (end < data.len and data[end] != '\n') end += 1;
+    return .{ .start = start, .end = end };
 }
 
 fn isBinary(data: []const u8) bool {
@@ -473,6 +551,7 @@ test "search and replace tmpdir" {
         replace: ?[]const u8 = null,
         dry_run: bool = false,
         ignore_case: bool = false,
+        multiline: bool = false,
         context: u32 = 0,
         after: u32 = 0,
         before: u32 = 0,
@@ -548,4 +627,45 @@ fn isMultiPathSearch(cwd: std.fs.Dir, paths: []const []const u8) bool {
         if (st.kind == .directory) return true;
     }
     return false;
+}
+
+test "bench LineTracker vs naive offsetToLine" {
+    const alloc = std.testing.allocator;
+
+    // Generate ~1MB with ~10k lines
+    var hay: std.ArrayListUnmanaged(u8) = .{};
+    defer hay.deinit(alloc);
+    for (0..10000) |_| try hay.appendSlice(alloc, "this is a line of text with some content here\n");
+    const data = hay.items;
+    const line_count: usize = 10000;
+
+    // Generate offsets spread across the file (simulating match positions)
+    var offsets: [1000]usize = undefined;
+    for (&offsets, 0..) |*o, i| o.* = (i * data.len) / 1000;
+
+    std.debug.print("\nbench LineTracker: {d}KB, {d} lines, {d} lookups\n", .{ data.len / 1024, line_count, offsets.len });
+
+    // Naive: O(n) per lookup
+    var timer = try std.time.Timer.start();
+    var sum: usize = 0;
+    for (offsets) |off| sum += offsetToLine(data, off);
+    const naive_ns = timer.read();
+
+    // LineTracker: O(delta) per lookup
+    timer.reset();
+    var sum2: usize = 0;
+    var tracker = LineTracker{};
+    for (offsets) |off| sum2 += tracker.lineAt(data, off);
+    const tracker_ns = timer.read();
+
+    try std.testing.expectEqual(sum, sum2);
+    const speedup = @as(f64, @floatFromInt(naive_ns)) / @as(f64, @floatFromInt(@max(tracker_ns, 1)));
+    std.debug.print("  naive: {d}ms, tracker: {d}ms, speedup: {d:.1}x\n", .{
+        naive_ns / std.time.ns_per_ms,
+        tracker_ns / std.time.ns_per_ms,
+        speedup,
+    });
+
+    // Tracker should be significantly faster for sequential access
+    try std.testing.expect(speedup > 10.0);
 }
