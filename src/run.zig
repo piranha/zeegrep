@@ -158,8 +158,6 @@ pub fn run(allocator: std.mem.Allocator, writer: *std.io.Writer, options: anytyp
         std.mem.sort(Result, shared.results.items, {}, Result.less);
         var first_out = true;
         for (shared.results.items) |r| {
-            defer shared_alloc.free(r.path);
-            defer shared_alloc.free(r.out);
             if (!options.quiet) {
                 if (shared.heading and !first_out) try writer.writeByte('\n');
                 first_out = false;
@@ -169,11 +167,11 @@ pub fn run(allocator: std.mem.Allocator, writer: *std.io.Writer, options: anytyp
     }
 
     if (options.replace != null and !options.quiet) {
-        try writer.print("{d} files, {d} replacements\n", .{ shared.files_changed, shared.total_repls });
+        try writer.print("{d} files, {d} replacements\n", .{ shared.files_changed.load(.monotonic), shared.total_repls.load(.monotonic) });
     }
 
-    if (shared.had_error) return error.JobFailed;
-    if (shared.total_matches == 0 and shared.total_repls == 0) return error.NoMatches;
+    if (shared.had_error.load(.monotonic)) return error.JobFailed;
+    if (shared.total_matches.load(.monotonic) == 0 and shared.total_repls.load(.monotonic) == 0) return error.NoMatches;
 }
 
 const Result = struct {
@@ -199,57 +197,65 @@ const Shared = struct {
     results: std.ArrayListUnmanaged(Result) = .{},
     first_out: bool = true,
 
-    total_matches: usize = 0,
-    total_repls: usize = 0,
-    files_changed: usize = 0,
-    had_error: bool = false,
+    total_matches: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    total_repls: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    files_changed: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    had_error: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     fn init(allocator: std.mem.Allocator, before: u32, after: u32, color: bool, heading: bool, sort: bool, replace: ?[]const u8, writer: *std.io.Writer) Shared {
         return .{ .allocator = allocator, .before = before, .after = after, .color = color, .heading = heading, .sort = sort, .replace = replace, .writer = writer };
     }
 
     fn deinit(self: *Shared) void {
+        for (self.results.items) |r| {
+            self.allocator.free(r.path);
+            self.allocator.free(r.out);
+        }
         self.results.deinit(self.allocator);
     }
 
     fn add(self: *Shared, matches: usize, repls: usize, changed: bool) void {
-        self.mu.lock();
-        defer self.mu.unlock();
-        self.total_matches += matches;
-        self.total_repls += repls;
-        if (changed) self.files_changed += 1;
+        _ = self.total_matches.fetchAdd(matches, .monotonic);
+        _ = self.total_repls.fetchAdd(repls, .monotonic);
+        if (changed) _ = self.files_changed.fetchAdd(1, .monotonic);
     }
 
     /// Output result: buffer if sorting, stream to writer if not
     fn output(self: *Shared, path: []const u8, out: []const u8) void {
-        self.mu.lock();
-        defer self.mu.unlock();
         if (self.sort) {
+            const d_path = self.allocator.dupe(u8, path) catch {
+                self.fail();
+                return;
+            };
+            const d_out = self.allocator.dupe(u8, out) catch {
+                self.allocator.free(d_path);
+                self.fail();
+                return;
+            };
+
+            self.mu.lock();
+            defer self.mu.unlock();
             self.results.append(self.allocator, .{
-                .path = self.allocator.dupe(u8, path) catch {
-                    self.had_error = true;
-                    return;
-                },
-                .out = self.allocator.dupe(u8, out) catch {
-                    self.had_error = true;
-                    return;
-                },
+                .path = d_path,
+                .out = d_out,
             }) catch {
-                self.had_error = true;
+                self.allocator.free(d_path);
+                self.allocator.free(d_out);
+                self.had_error.store(true, .monotonic);
             };
         } else {
+            self.mu.lock();
+            defer self.mu.unlock();
             if (self.heading and !self.first_out) self.writer.writeByte('\n') catch {};
             self.first_out = false;
             self.writer.writeAll(out) catch {
-                self.had_error = true;
+                self.had_error.store(true, .monotonic);
             };
         }
     }
 
     fn fail(self: *Shared) void {
-        self.mu.lock();
-        self.had_error = true;
-        self.mu.unlock();
+        self.had_error.store(true, .monotonic);
     }
 };
 
