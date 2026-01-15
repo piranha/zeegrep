@@ -24,6 +24,7 @@ pub const Options = struct {
     file_names: bool = false,
     hidden: bool = false,
     debug: bool = false,
+
     color: ansi.Color = .auto,
     include: opt.Multi([]const u8, 64) = .{},
     exclude: opt.Multi([]const u8, 64) = .{},
@@ -44,6 +45,7 @@ pub const Options = struct {
         .file_names = .{ .short = 'f', .help = "Match against file names (not contents)" },
         .hidden = .{ .help = "Search hidden files and directories" },
         .debug = .{ .help = "Show skipped files and reasons" },
+
         .color = .{ .help = "Colorize output (auto|always|never)" },
         .include = .{ .short = 'g', .help = "Only paths containing substring (repeatable)" },
         .exclude = .{ .short = 'x', .help = "Skip paths containing substring (repeatable)" },
@@ -95,7 +97,8 @@ pub fn run(allocator: std.mem.Allocator, writer: *std.io.Writer, options: anytyp
     const shared_alloc = ts.allocator();
 
     var pool: core_pool.Pool = .{};
-    try pool.init(allocator, null);
+    const n_jobs: usize = @min(3, std.Thread.getCpuCount() catch 3);
+    try pool.init(allocator, n_jobs);
     defer pool.deinit();
 
     const is_tty = std.fs.File.stdout().isTty();
@@ -358,25 +361,19 @@ fn Job(comptime Opts: type) type {
                 return;
             }
 
-            // Stream matches directly (no intermediate allocation)
-            var out: std.ArrayListUnmanaged(u8) = .{};
             const has_context = shared.before > 0 or shared.after > 0;
+
+            // Stream matches to buffer, then output
+            var out: std.ArrayListUnmanaged(u8) = .{};
             const result = try streamMatches(out.writer(tmp), shared.color, shared.heading, has_context, path, pat, data, shared.before, shared.after, options.ignore_case, options.quiet or options.count);
             if (result.match_count == 0) return;
             shared.add(result.match_count, 0, false);
-
             if (options.quiet) return;
             if (options.count) {
                 out.clearRetainingCapacity();
                 try out.writer(tmp).print("{f}:{f}\n", .{ ansi.styled(shared.color, .path, path), ansi.styled(shared.color, .line_no, result.match_count) });
-                shared.output(path, out.items);
-                return;
             }
-
-            if (out.items.len > 0) {
-                shared.output(path, out.items);
-                return;
-            }
+            if (out.items.len > 0) shared.output(path, out.items);
             return;
         }
     };
@@ -562,7 +559,7 @@ const LineTracker = struct {
         if (offset >= self.pos) {
             var i = self.pos;
             const limit = @min(offset, data.len);
-            
+
             // SIMD forward
             const Vec = @Vector(32, u8);
             const nl: Vec = @splat('\n');
@@ -572,7 +569,7 @@ const LineTracker = struct {
                 self.line += @popCount(@as(u32, @bitCast(matches)));
                 i += 32;
             }
-            
+
             // Scalar tail
             while (i < limit) : (i += 1) {
                 if (data[i] == '\n') self.line += 1;
