@@ -163,7 +163,13 @@ pub fn run(allocator: std.mem.Allocator, writer: *std.io.Writer, options: anytyp
         var first_out = true;
         for (shared.results.items) |r| {
             if (!options.quiet) {
-                if (shared.heading and !first_out) try writer.writeByte('\n');
+                if (!first_out) {
+                    if (shared.heading) {
+                        try writer.writeByte('\n');
+                    } else if (shared.before > 0 or shared.after > 0) {
+                        try writer.print("{f}\n", .{ansi.styled(shared.color, .dim, "--")});
+                    }
+                }
                 first_out = false;
                 try writer.writeAll(r.out);
             }
@@ -250,7 +256,13 @@ const Shared = struct {
         } else {
             self.mu.lock();
             defer self.mu.unlock();
-            if (self.heading and !self.first_out) self.writer.writeByte('\n') catch {};
+            if (!self.first_out) {
+                if (self.heading) {
+                    self.writer.writeByte('\n') catch {};
+                } else if (self.before > 0 or self.after > 0) {
+                    self.writer.print("{f}\n", .{ansi.styled(self.color, .dim, "--")}) catch {};
+                }
+            }
             self.first_out = false;
             self.writer.writeAll(out) catch {
                 self.had_error.store(true, .monotonic);
@@ -358,7 +370,8 @@ fn Job(comptime Opts: type) type {
             }
 
             var out: std.ArrayListUnmanaged(u8) = .{};
-            try formatMatches(out.writer(tmp), shared.color, shared.heading, path, result.lines, pat, options.ignore_case);
+            const has_context = shared.before > 0 or shared.after > 0;
+            try formatMatches(out.writer(tmp), shared.color, shared.heading, has_context, path, result.lines, pat, options.ignore_case);
             if (out.items.len > 0) shared.output(path, out.items);
         }
     };
@@ -406,12 +419,13 @@ fn collectMatches(
             var ctx_line = ctx_start;
             while (ctx_line < start_line) : (ctx_line += 1) {
                 if (ctx_line > last_line) {
-                    const le = lineAtIndex(data, ctx_line);
-                    try results.append(allocator, .{
-                        .line_no = ctx_line,
-                        .text = le.text,
-                        .is_context = true,
-                    });
+                    if (lineAtIndex(data, ctx_line)) |le| {
+                        try results.append(allocator, .{
+                            .line_no = ctx_line,
+                            .text = le.text,
+                            .is_context = true,
+                        });
+                    }
                 }
             }
         }
@@ -449,13 +463,15 @@ fn collectMatches(
             var ctx_line = match_end + 1;
             const ctx_end = match_end + after;
             while (ctx_line <= ctx_end) : (ctx_line += 1) {
-                const le = lineAtIndex(data, ctx_line);
-                if (le.text.len == 0 and ctx_line > 1) break; // EOF
-                try results.append(allocator, .{
-                    .line_no = ctx_line,
-                    .text = le.text,
-                    .is_context = true,
-                });
+                if (lineAtIndex(data, ctx_line)) |le| {
+                    try results.append(allocator, .{
+                        .line_no = ctx_line,
+                        .text = le.text,
+                        .is_context = true,
+                    });
+                } else {
+                    break; // EOF
+                }
             }
             last_line = @max(last_line, ctx_end);
         }
@@ -468,6 +484,7 @@ fn formatMatches(
     writer: anytype,
     color: bool,
     heading: bool,
+    has_context: bool,
     path: []const u8,
     lines: []const MatchLine,
     pat: *const engine.Pattern,
@@ -480,8 +497,8 @@ fn formatMatches(
     for (lines) |line| {
         const in_multiline = multiline_end > 0 and line.line_no <= multiline_end;
 
-        // Separator for non-contiguous lines
-        if (last_line > 0 and line.line_no > last_line + 1 and !in_multiline) {
+        // Separator for non-contiguous line groups when context is enabled
+        if (has_context and last_line > 0 and line.line_no > last_line + 1 and !in_multiline) {
             try writer.print("{f}\n", .{ansi.styled(color, .dim, "--")});
         }
 
@@ -520,7 +537,7 @@ fn formatMatches(
     }
 }
 
-fn lineAtIndex(data: []const u8, line_no: usize) struct { text: []const u8 } {
+fn lineAtIndex(data: []const u8, line_no: usize) ?struct { text: []const u8 } {
     var current_line: usize = 1;
     var start: usize = 0;
     for (data, 0..) |c, i| {
@@ -534,7 +551,7 @@ fn lineAtIndex(data: []const u8, line_no: usize) struct { text: []const u8 } {
         }
     }
     // Line beyond EOF
-    return .{ .text = "" };
+    return null;
 }
 
 fn offsetToLine(data: []const u8, offset: usize) usize {
