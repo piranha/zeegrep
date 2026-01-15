@@ -2,12 +2,12 @@
 
 Setup:
 
-    $ echo "hello world" > test.txt
+    $ echo "hello there world" > test.txt
 
 Color never - no escape sequences:
 
     $ zg hello --color never test.txt | cat -v
-    test.txt:1:hello world
+    test.txt:1:hello there world
 
 Color always - output contains escape sequences (^[ shown by cat -v):
 

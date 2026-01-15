@@ -183,7 +183,7 @@ pub const ReplaceResult = struct {
 };
 
 pub fn replaceAll(allocator: std.mem.Allocator, code: *const Code, subject: []const u8, repl: []const u8) !ReplaceResult {
-    const opts: c_uint = c.PCRE2_SUBSTITUTE_GLOBAL | c.PCRE2_SUBSTITUTE_OVERFLOW_LENGTH;
+    const opts: c_uint = c.PCRE2_SUBSTITUTE_GLOBAL | c.PCRE2_SUBSTITUTE_OVERFLOW_LENGTH | c.PCRE2_SUBSTITUTE_EXTENDED;
 
     const cap: usize = subject.len + 64;
     var out = try allocator.alloc(u8, cap);

@@ -77,11 +77,15 @@ pub fn run(allocator: std.mem.Allocator, writer: *std.io.Writer, options: anytyp
     // Interpret escape sequences in pattern and replacement
     const processed_pattern = try engine.interpretEscapes(allocator, pattern);
     defer allocator.free(processed_pattern);
-    const processed_replace = if (options.replace) |r| try engine.interpretEscapes(allocator, r) else null;
-    defer if (processed_replace) |r| allocator.free(r);
+    const escaped_replace = if (options.replace) |r| try engine.interpretEscapes(allocator, r) else null;
+    defer if (escaped_replace) |r| allocator.free(r);
 
     var pat = try engine.compile(allocator, processed_pattern, options.ignore_case, options.multiline);
     defer pat.deinit();
+
+    // For literal patterns, expand $0 to needle once (not per-file)
+    const processed_replace = if (escaped_replace) |r| try pat.expandReplace(allocator, r) else null;
+    defer if (processed_replace) |r| if (r.ptr != (escaped_replace orelse r).ptr) allocator.free(r);
 
     const before: u32 = if (options.context > 0) options.context else options.before;
     const after: u32 = if (options.context > 0) options.context else options.after;

@@ -14,6 +14,15 @@ pub const Pattern = union(enum) {
         }
         self.* = .{ .literal = bmh.Matcher.init("", false) };
     }
+
+    /// For literal patterns, expand $0 in replacement to needle (match is always needle).
+    /// Returns repl unchanged for regex patterns or if no $0 present.
+    pub fn expandReplace(self: *const Pattern, allocator: std.mem.Allocator, repl: []const u8) ![]const u8 {
+        return switch (self.*) {
+            .literal => |*m| expandRef(allocator, repl, m.needle),
+            .regex => repl,
+        };
+    }
 };
 
 pub fn compile(allocator: std.mem.Allocator, pat: []const u8, ignore_case: bool, dotall: bool) !Pattern {
@@ -192,6 +201,25 @@ fn replaceLiteral(allocator: std.mem.Allocator, hay: []const u8, m: *const bmh.M
     return .{ .out = try out.toOwnedSlice(allocator), .n = n };
 }
 
+/// Expand $0 references in replacement string. Returns repl unchanged if no $0 present.
+fn expandRef(allocator: std.mem.Allocator, repl: []const u8, match: []const u8) ![]const u8 {
+    if (std.mem.indexOf(u8, repl, "$0") == null) return repl;
+
+    var out: std.ArrayListUnmanaged(u8) = .{};
+    errdefer out.deinit(allocator);
+    var i: usize = 0;
+    while (i < repl.len) {
+        if (i + 1 < repl.len and repl[i] == '$' and repl[i + 1] == '0') {
+            try out.appendSlice(allocator, match);
+            i += 2;
+        } else {
+            try out.append(allocator, repl[i]);
+            i += 1;
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 fn writeHighlightedLiteral(on: bool, writer: anytype, hay: []const u8, m: *const bmh.Matcher) !void {
     const needle_len = m.needle.len;
     if (needle_len == 0) return writer.writeAll(hay);
@@ -222,6 +250,17 @@ test "literal replace" {
     defer std.testing.allocator.free(rr.out);
     try std.testing.expectEqual(@as(usize, 2), rr.n);
     try std.testing.expectEqualStrings("xx bar bar yy", rr.out);
+}
+
+test "literal replace with $0" {
+    var p = try compile(std.testing.allocator, "foo", false, false);
+    defer p.deinit();
+    const repl = try p.expandReplace(std.testing.allocator, "$0bar");
+    defer if (repl.ptr != "$0bar".ptr) std.testing.allocator.free(repl);
+    const rr = try replaceAll(std.testing.allocator, &p, "xx foo yy foo zz", repl, false);
+    defer std.testing.allocator.free(rr.out);
+    try std.testing.expectEqual(@as(usize, 2), rr.n);
+    try std.testing.expectEqualStrings("xx foobar yy foobar zz", rr.out);
 }
 
 test "bench iterator high match count" {
