@@ -69,7 +69,7 @@ pub const Options = struct {
     };
 };
 
-pub fn run(allocator: std.mem.Allocator, writer: anytype, options: anytype, pattern: []const u8, paths: []const []const u8) !void {
+pub fn run(allocator: std.mem.Allocator, writer: *std.io.Writer, options: anytype, pattern: []const u8, paths: []const []const u8) !void {
     const cwd = std.fs.cwd();
 
     if (options.file_names and options.replace != null) return error.InvalidArgs;
@@ -100,7 +100,7 @@ pub fn run(allocator: std.mem.Allocator, writer: anytype, options: anytype, patt
     const use_color = ansi.enabled(options.color, is_tty, no_color != null);
     const use_heading = is_tty and options.replace == null and !options.quiet and !options.count and !options.file_names and isMultiPathSearch(cwd, paths);
 
-    var shared = Shared.init(shared_alloc, before, after, use_color, use_heading, options.sort, processed_replace, writer.any());
+    var shared = Shared.init(shared_alloc, before, after, use_color, use_heading, options.sort, processed_replace, writer);
     defer shared.deinit();
 
     var scope = pool.scope();
@@ -193,7 +193,7 @@ const Shared = struct {
     heading: bool,
     sort: bool,
     replace: ?[]const u8,
-    writer: std.io.AnyWriter,
+    writer: *std.io.Writer,
 
     mu: std.Thread.Mutex = .{},
     results: std.ArrayListUnmanaged(Result) = .{},
@@ -204,7 +204,7 @@ const Shared = struct {
     files_changed: usize = 0,
     had_error: bool = false,
 
-    fn init(allocator: std.mem.Allocator, before: u32, after: u32, color: bool, heading: bool, sort: bool, replace: ?[]const u8, writer: std.io.AnyWriter) Shared {
+    fn init(allocator: std.mem.Allocator, before: u32, after: u32, color: bool, heading: bool, sort: bool, replace: ?[]const u8, writer: *std.io.Writer) Shared {
         return .{ .allocator = allocator, .before = before, .after = after, .color = color, .heading = heading, .sort = sort, .replace = replace, .writer = writer };
     }
 
@@ -302,8 +302,8 @@ fn Job(comptime Opts: type) type {
                 return;
             };
             if (stat.size == 0) return; // empty files aren't interesting
-            if (stat.size > 64 * 1024 * 1024) {
-                if (options.debug) debugSkip(path, "file too large (>64MB)");
+            if (stat.size > 1024 * 1024 * 1024) {
+                if (options.debug) debugSkip(path, "file too large (>1GB)");
                 return;
             }
 
@@ -656,51 +656,51 @@ test "search and replace tmpdir" {
     try o.include.append(".txt");
 
     var buf: [2048]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
+    var w = std.io.Writer.fixed(&buf);
 
     // Search
-    _ = run(std.testing.allocator, fbs.writer(), o, "foo", &.{root}) catch |e| {
+    _ = run(std.testing.allocator, &w, o, "foo", &.{root}) catch |e| {
         try std.testing.expect(e != error.NoMatches);
         return e;
     };
-    var out = fbs.getWritten();
+    var out = w.buffered();
     try std.testing.expect(std.mem.indexOf(u8, out, "a.txt") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "1:foo1") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "3:foo2") != null);
 
     // Replace dry-run
-    fbs.reset();
+    w.end = 0;
     o.replace = "bar$1";
     o.dry_run = true;
-    _ = run(std.testing.allocator, fbs.writer(), o, "foo(\\d+)", &.{root}) catch {};
-    out = fbs.getWritten();
+    _ = run(std.testing.allocator, &w, o, "foo(\\d+)", &.{root}) catch {};
+    out = w.buffered();
     try std.testing.expect(std.mem.indexOf(u8, out, "replacements") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "──") != null);
 
     // Count (per-file)
-    fbs.reset();
+    w.end = 0;
     o.replace = null;
     o.dry_run = false;
     o.count = true;
-    _ = run(std.testing.allocator, fbs.writer(), o, "foo", &.{root}) catch {};
-    out = fbs.getWritten();
+    _ = run(std.testing.allocator, &w, o, "foo", &.{root}) catch {};
+    out = w.buffered();
     try std.testing.expect(std.mem.indexOf(u8, out, "a.txt:2") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "b.txt") == null);
 
     // -f (path match)
-    fbs.reset();
+    w.end = 0;
     o.count = false;
     o.file_names = true;
-    _ = run(std.testing.allocator, fbs.writer(), o, "a.txt", &.{root}) catch {};
-    out = fbs.getWritten();
+    _ = run(std.testing.allocator, &w, o, "a.txt", &.{root}) catch {};
+    out = w.buffered();
     try std.testing.expect(std.mem.indexOf(u8, out, "a.txt") != null);
 
     // Streaming (sort=false) - output goes directly to writer
-    fbs.reset();
+    w.end = 0;
     o.file_names = false;
     o.sort = false;
-    _ = run(std.testing.allocator, fbs.writer(), o, "foo", &.{root}) catch {};
-    out = fbs.getWritten();
+    _ = run(std.testing.allocator, &w, o, "foo", &.{root}) catch {};
+    out = w.buffered();
     try std.testing.expect(std.mem.indexOf(u8, out, "a.txt") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "foo1") != null);
 }

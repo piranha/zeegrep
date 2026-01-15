@@ -60,8 +60,8 @@ pub fn main() !void {
     }
     const paths = path_buf[0..n_paths];
 
-    const stdout = std.fs.File.stdout().deprecatedWriter();
-    run.run(allocator, stdout, options, pattern, paths) catch |e| switch (e) {
+    var stdout = std.fs.File.stdout().writer(&.{});
+    run.run(allocator, &stdout.interface, options, pattern, paths) catch |e| switch (e) {
         error.NoMatches => std.process.exit(1),
         else => std.process.exit(2),
     };
