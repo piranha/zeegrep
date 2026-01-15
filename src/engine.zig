@@ -25,15 +25,18 @@ pub const Pattern = union(enum) {
     }
 };
 
-/// Regex with optional literal prefix optimization.
-/// If pattern starts with literal bytes, use BMH to find candidates before running PCRE2.
+/// Regex with optional literal optimization.
+/// - prefix: seek literal then run regex from nearby (for non-greedy patterns)
+/// - filter: check if line contains literal before running regex (for greedy patterns)
 pub const OptimizedRegex = struct {
     code: pcre2.Code,
-    prefix: ?bmh.Matcher = null, // null = no optimization possible
+    prefix: ?bmh.Matcher = null, // seek optimization (backtrack-safe patterns)
+    filter: ?bmh.Matcher = null, // line filter (greedy patterns - filter only, no seek)
 
     pub fn deinit(self: *OptimizedRegex) void {
         self.code.deinit();
         self.prefix = null;
+        self.filter = null;
     }
 };
 
@@ -44,20 +47,26 @@ pub fn compile(allocator: std.mem.Allocator, pat: []const u8, ignore_case: bool,
 pub fn compileOpts(allocator: std.mem.Allocator, pat: []const u8, ignore_case: bool, dotall: bool, force_literal: bool) !Pattern {
     if (!force_literal and isRegex(pat)) {
         const code = try pcre2.compile(allocator, pat, ignore_case, dotall);
-        // Extract longest literal for seek optimization.
-        // We find the literal with BMH, then back up and run regex.
-        // CAVEAT: patterns starting with .+ or .* can cause backtracking when literal
-        // is found but regex fails. Only use when safe.
         const literal_str = extractLongestLiteral(pat);
-        // Disable optimization for multiline patterns, dotall mode, or greedy prefix patterns
-        // - containsNewline: pattern has literal newlines (match spans lines)
-        // - dotall: . matches newlines, so match can span lines
-        // - startsWithGreedy: can cause backtracking issues
-        const literal = if (literal_str.len >= 3 and !startsWithGreedy(pat) and !containsNewline(pat) and !dotall)
-            bmh.Matcher.init(literal_str, ignore_case)
-        else
-            null;
-        return .{ .regex = .{ .code = code, .prefix = literal } };
+        const has_literal = literal_str.len >= 3;
+        const is_greedy = startsWithGreedy(pat);
+        const is_multiline = containsNewline(pat) or dotall;
+
+        // Choose optimization strategy:
+        // - prefix: safe to seek literal and backtrack (non-greedy, single-line)
+        // - filter: only filter lines by literal, run regex per-line (greedy patterns)
+        // - none: multiline patterns can't use line-based optimization
+        var prefix: ?bmh.Matcher = null;
+        var filter: ?bmh.Matcher = null;
+
+        if (has_literal and !is_multiline) {
+            if (is_greedy) {
+                filter = bmh.Matcher.init(literal_str, ignore_case);
+            } else {
+                prefix = bmh.Matcher.init(literal_str, ignore_case);
+            }
+        }
+        return .{ .regex = .{ .code = code, .prefix = prefix, .filter = filter } };
     }
     return .{ .literal = bmh.Matcher.init(pat, ignore_case) };
 }
@@ -174,8 +183,9 @@ pub fn matchAny(pat: *const Pattern, hay: []const u8, ignore_case: bool) bool {
     switch (pat.*) {
         .literal => |*m| return m.contains(hay),
         .regex => |*r| {
-            // Fast path: if prefix exists and not found, skip regex
-            if (r.prefix) |*p| {
+            // Fast path: if literal filter exists and not found, skip regex
+            const lit = r.prefix orelse r.filter;
+            if (lit) |*p| {
                 if (!p.contains(hay)) return false;
             }
             return pcre2.matchAny(&r.code, hay);
@@ -188,7 +198,8 @@ pub fn countMatches(pat: *const Pattern, hay: []const u8, ignore_case: bool) usi
     switch (pat.*) {
         .literal => |*m| return m.count(hay),
         .regex => |*r| {
-            if (r.prefix) |*p| {
+            const lit = r.prefix orelse r.filter;
+            if (lit) |*p| {
                 if (!p.contains(hay)) return 0;
             }
             return pcre2.countMatches(&r.code, hay);
@@ -226,7 +237,8 @@ pub const MatchIterator = union(enum) {
 
 const RegexIterator = struct {
     inner: pcre2.MatchIterator,
-    literal: ?*const bmh.Matcher,
+    prefix: ?*const bmh.Matcher, // seek optimization
+    filter: ?*const bmh.Matcher, // line filter optimization
     hay: []const u8,
     pos: usize = 0,
     // Max chars the pattern can match before the literal (for backtrack limit)
@@ -236,7 +248,8 @@ const RegexIterator = struct {
     fn init(r: *const OptimizedRegex, hay: []const u8) RegexIterator {
         return .{
             .inner = pcre2.MatchIterator.init(&r.code, hay),
-            .literal = if (r.prefix) |*p| p else null,
+            .prefix = if (r.prefix) |*p| p else null,
+            .filter = if (r.filter) |*f| f else null,
             .hay = hay,
         };
     }
@@ -246,14 +259,21 @@ const RegexIterator = struct {
     }
 
     fn next(self: *RegexIterator) ?Span {
-        const lit = self.literal orelse return self.inner.next();
+        // Prefix optimization: seek literal, backtrack limited amount, run regex
+        if (self.prefix) |lit| return self.nextWithPrefix(lit);
 
-        // Strategy: find literal with BMH, back up a limited amount, run regex from there.
+        // Filter optimization: scan lines for literal, run regex only on matching lines
+        if (self.filter) |lit| return self.nextWithFilter(lit);
+
+        // No optimization: raw pcre2 iteration
+        return self.inner.next();
+    }
+
+    /// Seek literal with BMH, back up limited amount, run regex from there.
+    fn nextWithPrefix(self: *RegexIterator, lit: *const bmh.Matcher) ?Span {
         while (true) {
-            // Find next occurrence of literal
             const lit_pos = lit.indexOfPos(self.hay, self.pos) orelse return null;
 
-            // Find line boundaries for this occurrence
             const line_start = if (std.mem.lastIndexOfScalar(u8, self.hay[0..lit_pos], '\n')) |nl|
                 nl + 1
             else
@@ -263,29 +283,54 @@ const RegexIterator = struct {
             else
                 self.hay.len;
 
-            // Back up from literal position, but not past line start or MAX_BACKTRACK
             const backtrack_limit = if (lit_pos > MAX_BACKTRACK) lit_pos - MAX_BACKTRACK else 0;
             const search_start = @max(@max(line_start, backtrack_limit), self.inner.pos);
 
-            // Try regex match starting near the literal
             if (search_start <= lit_pos) {
                 if (self.inner.nextFrom(search_start)) |span| {
-                    // Only accept match if it's on the same line as the literal
                     if (span.end <= line_end + 1) {
-                        // Match found - update position to end of match
                         self.pos = if (span.end > span.start) span.end else span.start + 1;
                         self.inner.setPos(self.pos);
                         return span;
                     }
-                    // Match was beyond the line - this literal occurrence didn't produce a same-line match
                 }
             }
 
-            // No valid match at this literal position, move to next line
-            // (skip to end of current line to avoid re-checking same-line literals)
             self.pos = line_end + 1;
             self.inner.setPos(self.pos);
         }
+    }
+
+    /// Filter lines by literal, run regex only on lines containing the literal.
+    /// For greedy patterns (.+foo.+) where seek optimization would cause backtracking.
+    fn nextWithFilter(self: *RegexIterator, lit: *const bmh.Matcher) ?Span {
+        while (self.pos < self.hay.len) {
+            // Find next line
+            const line_start = self.pos;
+            const line_end = std.mem.indexOfScalarPos(u8, self.hay, line_start, '\n') orelse self.hay.len;
+            const line = self.hay[line_start..line_end];
+
+            // Move to next line for next iteration
+            self.pos = if (line_end < self.hay.len) line_end + 1 else self.hay.len;
+
+            // Skip line if literal not present
+            if (!lit.contains(line)) continue;
+
+            // Run regex on this line only
+            // Create a temporary match on the line slice, but need to return offsets into original hay
+            if (pcre2.matchAny(self.inner.code, line)) {
+                // Get actual match position within line
+                var line_iter = pcre2.MatchIterator.init(self.inner.code, line);
+                defer line_iter.deinit();
+                if (line_iter.next()) |span| {
+                    return .{
+                        .start = line_start + span.start,
+                        .end = line_start + span.end,
+                    };
+                }
+            }
+        }
+        return null;
     }
 };
 
@@ -310,7 +355,8 @@ pub fn findMatches(allocator: std.mem.Allocator, pat: *const Pattern, hay: []con
     switch (pat.*) {
         .literal => |*m| return findMatchesLiteral(allocator, hay, m),
         .regex => |*r| {
-            if (r.prefix) |*p| {
+            const lit = r.prefix orelse r.filter;
+            if (lit) |*p| {
                 if (!p.contains(hay)) return allocator.alloc(Span, 0);
             }
             return pcre2.findMatches(allocator, &r.code, hay);
@@ -347,8 +393,9 @@ pub fn replaceAll(allocator: std.mem.Allocator, pat: *const Pattern, hay: []cons
             return .{ .out = rr.out, .n = rr.n };
         },
         .regex => |*r| {
-            // For replace, skip if prefix not found (no matches possible)
-            if (r.prefix) |*p| {
+            // For replace, skip if literal not found (no matches possible)
+            const lit = r.prefix orelse r.filter;
+            if (lit) |*p| {
                 if (!p.contains(hay)) return .{ .out = try allocator.dupe(u8, hay), .n = 0 };
             }
             const rr = try pcre2.replaceAll(allocator, &r.code, hay, repl);
@@ -724,45 +771,46 @@ test "bench inner literal seek" {
     try std.testing.expect(ns < 500 * std.time.ns_per_ms);
 }
 
-test "greedy prefix disables optimization" {
+test "greedy prefix uses filter optimization" {
     const alloc = std.testing.allocator;
 
-    // .+metabase.+ should NOT use literal optimization (greedy prefix causes backtracking)
+    // .+metabase.+ should use FILTER (not prefix) - greedy prefix causes backtracking
     var pat = try compile(alloc, ".+metabase.+", false, false);
     defer pat.deinit();
     try std.testing.expect(pat.regex.prefix == null);
+    try std.testing.expect(pat.regex.filter != null);
+    try std.testing.expectEqualStrings("metabase", pat.regex.filter.?.needle);
 
-    // .*foo should NOT use optimization
+    // .*foo should use filter
     var pat2 = try compile(alloc, ".*foo", false, false);
     defer pat2.deinit();
     try std.testing.expect(pat2.regex.prefix == null);
+    try std.testing.expect(pat2.regex.filter != null);
 
-    // ..tabase SHOULD use optimization (fixed width prefix)
+    // ..tabase SHOULD use prefix (fixed width, safe to backtrack)
     var pat3 = try compile(alloc, "..tabase", false, false);
     defer pat3.deinit();
     try std.testing.expect(pat3.regex.prefix != null);
+    try std.testing.expect(pat3.regex.filter == null);
 
-    // meta.+se SHOULD use optimization (literal prefix)
+    // meta.+se SHOULD use prefix (literal prefix, safe)
     var pat4 = try compile(alloc, "meta.+se", false, false);
     defer pat4.deinit();
     try std.testing.expect(pat4.regex.prefix != null);
+    try std.testing.expect(pat4.regex.filter == null);
 }
 
-test "bench greedy prefix (pathological)" {
-    // Documents PCRE2 backtracking behavior with .+X.+ patterns.
-    // This is a known slow case - kept as benchmark for future optimization attempts.
-    // Possible improvements:
-    // - PCRE2 match_limit/depth_limit to bail early on backtracking
-    // - Possessive quantifiers (.++X.++) if pattern allows
-    // - Atomic groups (?>...) to prevent backtracking
-    // - Switch to DFA matching for simple patterns
+test "bench greedy prefix filter optimization" {
+    // Greedy prefix patterns (.+X.+) use line filter optimization:
+    // - BMH scans for literal to filter lines
+    // - PCRE2 runs only on lines containing the literal
+    // Compare with raw PCRE2 (no optimization) to show speedup.
     const alloc = std.testing.allocator;
 
     var hay: std.ArrayListUnmanaged(u8) = .{};
     defer hay.deinit(alloc);
 
-    // Mix of matching and non-matching lines with the literal
-    const total_lines = 5000; // Keep small - this is slow!
+    const total_lines = 5000;
     for (0..total_lines) |i| {
         if (i % 100 == 0) {
             // Matches: has chars before AND after "metabase"
@@ -776,30 +824,42 @@ test "bench greedy prefix (pathological)" {
     }
     const data = hay.items;
 
+    const expected = total_lines / 100; // Only lines with chars before AND after
+
+    // With filter optimization (current behavior)
     var pat = try compile(alloc, ".+metabase.+", false, false);
     defer pat.deinit();
-
-    // Optimization disabled for this pattern
-    try std.testing.expect(pat.regex.prefix == null);
+    try std.testing.expect(pat.regex.filter != null);
 
     var timer = try std.time.Timer.start();
     var count: usize = 0;
     var it = MatchIterator.init(&pat, data);
     defer it.deinit();
     while (it.next()) |_| count += 1;
-    const ns = timer.read();
-
-    const expected = total_lines / 100; // Only lines with chars before AND after
+    const opt_ns = timer.read();
     try std.testing.expectEqual(expected, count);
 
+    // Without optimization: raw PCRE2 iteration (simulated by using pcre2 directly)
+    timer.reset();
+    count = 0;
+    var raw_it = pcre2.MatchIterator.init(&pat.regex.code, data);
+    defer raw_it.deinit();
+    while (raw_it.next()) |_| count += 1;
+    const raw_ns = timer.read();
+    try std.testing.expectEqual(expected, count);
+
+    const speedup = @as(f64, @floatFromInt(raw_ns)) / @as(f64, @floatFromInt(@max(opt_ns, 1)));
+
     std.debug.print("\nbench greedy prefix: {d}KB, {d} lines\n", .{ data.len / 1024, total_lines });
-    std.debug.print("  .+metabase.+: {d}ms ({d} matches) [PATHOLOGICAL - no optimization]\n", .{
-        ns / std.time.ns_per_ms,
+    std.debug.print("  .+metabase.+: optimized={d}ms raw={d}ms speedup={d:.1}x ({d} matches)\n", .{
+        opt_ns / std.time.ns_per_ms,
+        raw_ns / std.time.ns_per_ms,
+        speedup,
         count,
     });
 
-    // No perf assertion - this is documenting current (slow) behavior
-    // Future: if we add backtrack limits or DFA mode, we can add a threshold here
+    // Should be at least 5x faster with filter optimization
+    try std.testing.expect(speedup > 5.0);
 }
 
 test "bench prefix vs inner literal" {
