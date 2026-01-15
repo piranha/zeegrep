@@ -92,7 +92,72 @@ pub fn run(allocator: std.mem.Allocator, writer: *std.io.Writer, options: anytyp
     const before: u32 = if (options.context > 0) options.context else options.before;
     const after: u32 = if (options.context > 0) options.context else options.after;
 
-    // Jobs use per-thread arenas for temp work; only final output uses shared allocator
+    const is_tty = std.fs.File.stdout().isTty();
+    const no_color = std.process.getEnvVarOwned(allocator, "NO_COLOR") catch null;
+    defer if (no_color) |v| allocator.free(v);
+    const use_color = ansi.enabled(options.color, is_tty, no_color != null);
+    const use_heading = is_tty and options.replace == null and !options.quiet and !options.count and !options.file_names and isMultiPathSearch(cwd, paths);
+
+    var ign = core_ignore.Stack.init(allocator);
+    defer ign.deinit();
+    try ign.pushDir(cwd, "");
+    defer ign.popDir();
+
+    // Sorted mode: collect paths, sort, process sequentially (streaming output, low memory)
+    // Parallel mode: walk and spawn jobs simultaneously
+    if (options.sort) {
+        var collected_paths: std.ArrayListUnmanaged([]const u8) = .{};
+        defer {
+            for (collected_paths.items) |p| allocator.free(p);
+            collected_paths.deinit(allocator);
+        }
+
+        const PathCollector = struct {
+            paths: *std.ArrayListUnmanaged([]const u8),
+            alloc: std.mem.Allocator,
+            cwd: std.fs.Dir,
+            use_abs: bool,
+
+            pub fn onFile(self: *@This(), path: []const u8) void {
+                const p = if (self.use_abs)
+                    self.cwd.realpathAlloc(self.alloc, path) catch return
+                else
+                    self.alloc.dupe(u8, path) catch return;
+                self.paths.append(self.alloc, p) catch self.alloc.free(p);
+            }
+        };
+        var collector = PathCollector{ .paths = &collected_paths, .alloc = allocator, .cwd = cwd, .use_abs = options.abs };
+        try core_walk.walkFiles(allocator, cwd, &ign, paths, options.include.constSlice(), options.exclude.constSlice(), options.hidden, true, &collector);
+
+        std.mem.sort([]const u8, collected_paths.items, {}, struct {
+            fn lt(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.lessThan(u8, a, b);
+            }
+        }.lt);
+
+        var state = StreamState{
+            .total_matches = 0,
+            .total_repls = 0,
+            .files_changed = 0,
+            .had_error = false,
+            .first_out = true,
+        };
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        for (collected_paths.items) |path| {
+            processFile(arena.allocator(), &state, path, &pat, options, use_color, use_heading, before, after, writer);
+            _ = arena.reset(.retain_capacity);
+        }
+
+        if (options.replace != null and !options.quiet) {
+            try writer.print("{d} files, {d} replacements\n", .{ state.files_changed, state.total_repls });
+        }
+        if (state.had_error) return error.JobFailed;
+        if (state.total_matches == 0 and state.total_repls == 0) return error.NoMatches;
+        return;
+    }
+
+    // Parallel mode
     var ts = std.heap.ThreadSafeAllocator{ .child_allocator = allocator };
     const shared_alloc = ts.allocator();
 
@@ -101,22 +166,10 @@ pub fn run(allocator: std.mem.Allocator, writer: *std.io.Writer, options: anytyp
     try pool.init(allocator, n_jobs);
     defer pool.deinit();
 
-    const is_tty = std.fs.File.stdout().isTty();
-    const no_color = std.process.getEnvVarOwned(allocator, "NO_COLOR") catch null;
-    defer if (no_color) |v| allocator.free(v);
-    const use_color = ansi.enabled(options.color, is_tty, no_color != null);
-    const use_heading = is_tty and options.replace == null and !options.quiet and !options.count and !options.file_names and isMultiPathSearch(cwd, paths);
-
-    var shared = Shared.init(shared_alloc, before, after, use_color, use_heading, options.sort, processed_replace, writer);
+    var shared = Shared.init(shared_alloc, before, after, use_color, use_heading, processed_replace, writer);
     defer shared.deinit();
 
     var scope = pool.scope();
-
-    // Walk and spawn jobs simultaneously (instead of collect-then-search)
-    var ign = core_ignore.Stack.init(allocator);
-    defer ign.deinit();
-    try ign.pushDir(cwd, "");
-    defer ign.popDir();
 
     const Walker = struct {
         scope: *core_pool.Scope,
@@ -148,37 +201,8 @@ pub fn run(allocator: std.mem.Allocator, writer: *std.io.Writer, options: anytyp
         .allocator = shared_alloc,
         .cwd = cwd,
     };
-    try core_walk.walkFiles(
-        allocator,
-        cwd,
-        &ign,
-        paths,
-        options.include.constSlice(),
-        options.exclude.constSlice(),
-        options.hidden,
-        options.sort,
-        &walker,
-    );
+    try core_walk.walkFiles(allocator, cwd, &ign, paths, options.include.constSlice(), options.exclude.constSlice(), options.hidden, false, &walker);
     scope.wait();
-
-    // When sorting, results are buffered - sort and output them
-    if (options.sort) {
-        std.mem.sort(Result, shared.results.items, {}, Result.less);
-        var first_out = true;
-        for (shared.results.items) |r| {
-            if (!options.quiet) {
-                if (!first_out) {
-                    if (use_heading) {
-                        try writer.writeByte('\n');
-                    } else if (before > 0 or after > 0) {
-                        try writer.print("{f}\n", .{ansi.styled(use_color, .dim, "--")});
-                    }
-                }
-                first_out = false;
-                try writer.writeAll(r.out);
-            }
-        }
-    }
 
     if (options.replace != null and !options.quiet) {
         try writer.print("{d} files, {d} replacements\n", .{ shared.files_changed.load(.monotonic), shared.total_repls.load(.monotonic) });
@@ -188,13 +212,12 @@ pub fn run(allocator: std.mem.Allocator, writer: *std.io.Writer, options: anytyp
     if (shared.total_matches.load(.monotonic) == 0 and shared.total_repls.load(.monotonic) == 0) return error.NoMatches;
 }
 
-const Result = struct {
-    path: []const u8,
-    out: []u8,
-
-    fn less(_: void, a: Result, b: Result) bool {
-        return std.mem.lessThan(u8, a.path, b.path);
-    }
+const StreamState = struct {
+    total_matches: usize,
+    total_repls: usize,
+    files_changed: usize,
+    had_error: bool,
+    first_out: bool,
 };
 
 const Shared = struct {
@@ -203,10 +226,8 @@ const Shared = struct {
     after: u32,
     color: bool,
     heading: bool,
-    sort: bool,
     replace: ?[]const u8,
     writer: *std.io.Writer,
-    results: std.ArrayListUnmanaged(Result) = .{}, // for --sort
 
     mu: std.Thread.Mutex = .{},
     first_out: bool = true,
@@ -216,16 +237,12 @@ const Shared = struct {
     files_changed: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     had_error: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
-    fn init(allocator: std.mem.Allocator, before: u32, after: u32, color: bool, heading: bool, sort: bool, replace: ?[]const u8, writer: *std.io.Writer) Shared {
-        return .{ .allocator = allocator, .before = before, .after = after, .color = color, .heading = heading, .sort = sort, .replace = replace, .writer = writer };
+    fn init(allocator: std.mem.Allocator, before: u32, after: u32, color: bool, heading: bool, replace: ?[]const u8, writer: *std.io.Writer) Shared {
+        return .{ .allocator = allocator, .before = before, .after = after, .color = color, .heading = heading, .replace = replace, .writer = writer };
     }
 
     fn deinit(self: *Shared) void {
-        for (self.results.items) |r| {
-            self.allocator.free(r.path);
-            self.allocator.free(r.out);
-        }
-        self.results.deinit(self.allocator);
+        _ = self;
     }
 
     fn add(self: *Shared, matches: usize, repls: usize, changed: bool) void {
@@ -234,22 +251,9 @@ const Shared = struct {
         if (changed) _ = self.files_changed.fetchAdd(1, .monotonic);
     }
 
-    fn output(self: *Shared, path: []const u8, out: []const u8) void {
+    fn output(self: *Shared, out: []const u8) void {
         self.mu.lock();
         defer self.mu.unlock();
-
-        if (self.sort) {
-            const d_path = self.allocator.dupe(u8, path) catch return;
-            const d_out = self.allocator.dupe(u8, out) catch {
-                self.allocator.free(d_path);
-                return;
-            };
-            self.results.append(self.allocator, .{ .path = d_path, .out = d_out }) catch {
-                self.allocator.free(d_path);
-                self.allocator.free(d_out);
-            };
-            return;
-        }
 
         if (!self.first_out) {
             if (self.heading) {
@@ -304,14 +308,14 @@ fn Job(comptime Opts: type) type {
                     var buf: std.ArrayListUnmanaged(u8) = .{};
                     const w = buf.writer(tmp);
                     try w.print("{f}:{f}\n", .{ ansi.styled(shared.color, .path, path), ansi.styled(shared.color, .line_no, n) });
-                    shared.output(path, buf.items);
+                    shared.output(buf.items);
                     return;
                 }
                 if (!options.quiet and !options.count) {
                     var buf: std.ArrayListUnmanaged(u8) = .{};
                     const w = buf.writer(tmp);
                     try w.print("{f}\n", .{ansi.styled(shared.color, .path, path)});
-                    shared.output(path, buf.items);
+                    shared.output(buf.items);
                     return;
                 }
                 return;
@@ -355,7 +359,7 @@ fn Job(comptime Opts: type) type {
                 if (options.dry_run and !options.quiet) {
                     var buf: std.ArrayListUnmanaged(u8) = .{};
                     _ = try diff.printChangedLines(buf.writer(tmp), shared.color, path, data, rr.out, shared.before, shared.after);
-                    shared.output(path, buf.items);
+                    shared.output(buf.items);
                     return;
                 }
                 return;
@@ -365,7 +369,7 @@ fn Job(comptime Opts: type) type {
 
             // Stream matches to buffer, then output
             var out: std.ArrayListUnmanaged(u8) = .{};
-            const result = try streamMatches(out.writer(tmp), shared.color, shared.heading, has_context, path, pat, data, shared.before, shared.after, options.ignore_case, options.quiet or options.count);
+            const result = try streamMatches(out.writer(tmp), shared.color, shared.heading, has_context, path, pat, data, shared.before, shared.after, options.ignore_case, options.quiet or options.count, null);
             if (result.match_count == 0) return;
             shared.add(result.match_count, 0, false);
             if (options.quiet) return;
@@ -373,10 +377,113 @@ fn Job(comptime Opts: type) type {
                 out.clearRetainingCapacity();
                 try out.writer(tmp).print("{f}:{f}\n", .{ ansi.styled(shared.color, .path, path), ansi.styled(shared.color, .line_no, result.match_count) });
             }
-            if (out.items.len > 0) shared.output(path, out.items);
+            if (out.items.len > 0) shared.output(out.items);
             return;
         }
     };
+}
+
+/// Single-threaded file processing for sorted mode - streams directly to writer
+fn processFile(
+    tmp: std.mem.Allocator,
+    state: *StreamState,
+    path: []const u8,
+    pat: *const engine.Pattern,
+    options: anytype,
+    color: bool,
+    heading: bool,
+    before: u32,
+    after: u32,
+    writer: *std.io.Writer,
+) void {
+    processFileInner(tmp, state, path, pat, options, color, heading, before, after, writer) catch |e| {
+        if (options.debug) std.debug.print("DEBUG: {s}: {s}\n", .{ path, @errorName(e) });
+        state.had_error = true;
+    };
+}
+
+fn processFileInner(
+    tmp: std.mem.Allocator,
+    state: *StreamState,
+    path: []const u8,
+    pat: *const engine.Pattern,
+    options: anytype,
+    color: bool,
+    heading: bool,
+    before: u32,
+    after: u32,
+    writer: *std.io.Writer,
+) !void {
+    if (options.file_names) {
+        if (!engine.matchAny(pat, path, options.ignore_case)) return;
+        const n = engine.countMatches(pat, path, options.ignore_case);
+        state.total_matches += n;
+        if (!options.quiet) {
+            try writeSeparator(state, writer, color, heading, before, after);
+            if (options.count) {
+                try writer.print("{f}:{f}\n", .{ ansi.styled(color, .path, path), ansi.styled(color, .line_no, n) });
+            } else {
+                try writer.print("{f}\n", .{ansi.styled(color, .path, path)});
+            }
+        }
+        return;
+    }
+
+    var f = std.fs.cwd().openFile(path, .{}) catch return;
+    defer f.close();
+
+    const stat = f.stat() catch return;
+    if (stat.size == 0) return;
+    if (stat.size > 1024 * 1024 * 1024) return;
+
+    const file_data = mapFile(tmp, f, stat.size) catch return;
+    defer unmapFile(tmp, file_data);
+    const data = file_data.ptr;
+
+    if (isBinary(data)) return;
+
+    if (options.replace) |repl| {
+        const rr = try engine.replaceAll(tmp, pat, data, repl, options.ignore_case);
+        if (rr.n == 0) return;
+
+        if (!options.dry_run) try writeAtomic(tmp, path, rr.out);
+
+        state.total_repls += rr.n;
+        state.files_changed += 1;
+        if (options.dry_run and !options.quiet) {
+            try writeSeparator(state, writer, color, heading, before, after);
+            _ = try diff.printChangedLines(writer, color, path, data, rr.out, before, after);
+        }
+        return;
+    }
+
+    const has_context = before > 0 or after > 0;
+
+    if (options.count) {
+        const result = try streamMatches(writer, color, heading, has_context, path, pat, data, before, after, options.ignore_case, true, &state.first_out);
+        if (result.match_count == 0) return;
+        state.total_matches += result.match_count;
+        if (options.quiet) return;
+        try writeSeparator(state, writer, color, heading, before, after);
+        try writer.print("{f}:{f}\n", .{ ansi.styled(color, .path, path), ansi.styled(color, .line_no, result.match_count) });
+        return;
+    }
+
+    const result = try streamMatches(writer, color, heading, has_context, path, pat, data, before, after, options.ignore_case, options.quiet, &state.first_out);
+    if (result.match_count == 0) return;
+    state.total_matches += result.match_count;
+    // streamMatches already wrote output with separators
+}
+
+fn writeSeparator(state: *StreamState, writer: *std.io.Writer, color: bool, heading: bool, before: u32, after: u32) !void {
+    if (!state.first_out) {
+        if (heading) {
+            try writer.writeByte('\n');
+        } else if (before > 0 or after > 0) {
+            try writer.print("{f}\n", .{ansi.styled(color, .dim, "--")});
+        }
+    }
+    state.first_out = false;
 }
 
 /// Stream matches directly to writer - no intermediate MatchLine allocation
@@ -392,6 +499,7 @@ fn streamMatches(
     after: u32,
     ignore_case: bool,
     count_only: bool,
+    first_out: ?*bool,
 ) !struct { match_count: usize } {
     var it = engine.MatchIterator.init(pat, data);
     defer it.deinit();
@@ -401,6 +509,7 @@ fn streamMatches(
     var last_emitted: usize = 0; // last line we wrote
     var last_match_line: usize = 0; // last line with a match (for dedup)
     var wrote_heading = false;
+    var wrote_file_sep = false; // wrote separator before this file's output
     var multiline_end: usize = 0;
     var pending_after: usize = 0; // context lines still owed after last match
 
@@ -418,6 +527,21 @@ fn streamMatches(
         if (count_only) {
             last_match_line = if (end_line > 0) end_line else start_line;
             continue;
+        }
+
+        // Write file separator before first output of this file
+        if (!wrote_file_sep) {
+            if (first_out) |fo| {
+                if (!fo.*) {
+                    if (heading) {
+                        try writer.writeByte('\n');
+                    } else if (has_context) {
+                        try writer.print("{f}\n", .{ansi.styled(color, .dim, "--")});
+                    }
+                }
+                fo.* = false;
+            }
+            wrote_file_sep = true;
         }
 
         // Emit pending after-context from previous match (up to this match's before-context)

@@ -62,9 +62,17 @@ pub fn main() !void {
     }
     const paths = path_buf[0..n_paths];
 
-    var stdout = std.fs.File.stdout().writer(&.{});
+    var write_buf: [64 * 1024]u8 = undefined;
+    var stdout = std.fs.File.stdout().writer(&write_buf);
     run.run(allocator, &stdout.interface, options, pattern, paths) catch |e| switch (e) {
-        error.NoMatches => std.process.exit(1),
-        else => std.process.exit(2),
+        error.NoMatches => {
+            stdout.interface.flush() catch {};
+            std.process.exit(1);
+        },
+        else => {
+            stdout.interface.flush() catch {};
+            std.process.exit(2);
+        },
     };
+    stdout.interface.flush() catch {};
 }
