@@ -4,28 +4,32 @@ const glob = @import("glob.zig");
 
 /// Walk files and call callback for each file (streaming)
 pub fn walkFiles(
+    allocator: std.mem.Allocator,
     cwd: std.fs.Dir,
     ign: *ignore.Stack,
     paths: []const []const u8,
     include: []const []const u8,
     exclude: []const []const u8,
     hidden: bool,
+    sorted: bool,
     ctx: anytype,
 ) !void {
     if (paths.len == 0) {
-        try walkRoot(cwd, ign, ".", include, exclude, hidden, ctx);
+        try walkRoot(allocator, cwd, ign, ".", include, exclude, hidden, sorted, ctx);
     } else for (paths) |root| {
-        try walkRoot(cwd, ign, root, include, exclude, hidden, ctx);
+        try walkRoot(allocator, cwd, ign, root, include, exclude, hidden, sorted, ctx);
     }
 }
 
 fn walkRoot(
+    allocator: std.mem.Allocator,
     cwd: std.fs.Dir,
     ign: *ignore.Stack,
     root: []const u8,
     include: []const []const u8,
     exclude: []const []const u8,
     hidden: bool,
+    sorted: bool,
     ctx: anytype,
 ) !void {
     const st = cwd.statFile(root) catch |e| switch (e) {
@@ -41,7 +45,7 @@ fn walkRoot(
             try ign.pushDir(d, prefix);
             defer ign.popDir();
         }
-        try walkDir(cwd, ign, prefix, d, include, exclude, hidden, ctx);
+        try walkDir(allocator, cwd, ign, prefix, d, include, exclude, hidden, sorted, ctx);
     } else {
         if (!passesFile(root, include, exclude)) return;
         if (ign.ignored(root, false, hidden)) return;
@@ -49,7 +53,17 @@ fn walkRoot(
     }
 }
 
+const Entry = struct {
+    name: []const u8,
+    kind: std.fs.Dir.Entry.Kind,
+
+    fn lessThan(_: void, a: Entry, b: Entry) bool {
+        return std.mem.lessThan(u8, a.name, b.name);
+    }
+};
+
 fn walkDir(
+    allocator: std.mem.Allocator,
     cwd: std.fs.Dir,
     ign: *ignore.Stack,
     prefix: []const u8,
@@ -57,41 +71,82 @@ fn walkDir(
     include: []const []const u8,
     exclude: []const []const u8,
     hidden: bool,
+    sorted: bool,
     ctx: anytype,
-) !void {
+) anyerror!void {
     var pathbuf: [std.fs.max_path_bytes]u8 = undefined;
-    var it = dir.iterate();
-    while (try it.next()) |ent| {
 
-        const rel = if (prefix.len == 0)
-            ent.name
-        else blk: {
-            const len = prefix.len + 1 + ent.name.len;
-            if (len > pathbuf.len) continue;
-            @memcpy(pathbuf[0..prefix.len], prefix);
-            pathbuf[prefix.len] = '/';
-            @memcpy(pathbuf[prefix.len + 1 ..][0..ent.name.len], ent.name);
-            break :blk pathbuf[0..len];
-        };
-
-        if (ent.kind == .directory) {
-            if (excluded(rel, exclude)) continue;
-        } else {
-            if (!passesFile(rel, include, exclude)) continue;
+    if (sorted) {
+        // Collect and sort entries
+        var entries: std.ArrayListUnmanaged(Entry) = .{};
+        defer {
+            for (entries.items) |e| allocator.free(e.name);
+            entries.deinit(allocator);
         }
-        if (ign.ignored(rel, ent.kind == .directory, hidden)) continue;
 
-        switch (ent.kind) {
-            .file => ctx.onFile(rel),
-            .directory => {
-                var sub = try cwd.openDir(rel, .{ .iterate = true });
-                defer sub.close();
-                try ign.pushDir(sub, rel);
-                defer ign.popDir();
-                try walkDir(cwd, ign, rel, sub, include, exclude, hidden, ctx);
-            },
-            else => {},
+        var it = dir.iterate();
+        while (try it.next()) |ent| {
+            if (ent.kind != .file and ent.kind != .directory) continue;
+            try entries.append(allocator, .{
+                .name = try allocator.dupe(u8, ent.name),
+                .kind = ent.kind,
+            });
         }
+        std.mem.sort(Entry, entries.items, {}, Entry.lessThan);
+
+        for (entries.items) |ent| {
+            try processEntry(allocator, cwd, ign, prefix, ent.name, ent.kind, &pathbuf, include, exclude, hidden, sorted, ctx);
+        }
+    } else {
+        var it = dir.iterate();
+        while (try it.next()) |ent| {
+            try processEntry(allocator, cwd, ign, prefix, ent.name, ent.kind, &pathbuf, include, exclude, hidden, sorted, ctx);
+        }
+    }
+}
+
+fn processEntry(
+    allocator: std.mem.Allocator,
+    cwd: std.fs.Dir,
+    ign: *ignore.Stack,
+    prefix: []const u8,
+    name: []const u8,
+    kind: std.fs.Dir.Entry.Kind,
+    pathbuf: *[std.fs.max_path_bytes]u8,
+    include: []const []const u8,
+    exclude: []const []const u8,
+    hidden: bool,
+    sorted: bool,
+    ctx: anytype,
+) anyerror!void {
+    const rel = if (prefix.len == 0)
+        name
+    else blk: {
+        const len = prefix.len + 1 + name.len;
+        if (len > pathbuf.len) return;
+        @memcpy(pathbuf[0..prefix.len], prefix);
+        pathbuf[prefix.len] = '/';
+        @memcpy(pathbuf[prefix.len + 1 ..][0..name.len], name);
+        break :blk pathbuf[0..len];
+    };
+
+    if (kind == .directory) {
+        if (excluded(rel, exclude)) return;
+    } else {
+        if (!passesFile(rel, include, exclude)) return;
+    }
+    if (ign.ignored(rel, kind == .directory, hidden)) return;
+
+    switch (kind) {
+        .file => ctx.onFile(rel),
+        .directory => {
+            var sub = cwd.openDir(rel, .{ .iterate = true }) catch return;
+            defer sub.close();
+            ign.pushDir(sub, rel) catch return;
+            defer ign.popDir();
+            walkDir(allocator, cwd, ign, rel, sub, include, exclude, hidden, sorted, ctx) catch {};
+        },
+        else => {},
     }
 }
 
@@ -146,7 +201,7 @@ test "walk files with include/exclude" {
     var collector = Collector{ .alloc = std.testing.allocator };
     defer collector.deinit();
 
-    try walkFiles(td.dir, &ign, &.{"."}, &.{"src"}, &.{"test"}, false, &collector);
+    try walkFiles(std.testing.allocator, td.dir, &ign, &.{"."}, &.{"src"}, &.{"test"}, false, false, &collector);
 
     try std.testing.expectEqual(@as(usize, 1), collector.files.items.len);
     try std.testing.expect(std.mem.endsWith(u8, collector.files.items[0], "src/a.clj"));
@@ -181,7 +236,7 @@ test "include does not prune directories" {
     var collector = Collector{ .alloc = std.testing.allocator };
     defer collector.deinit();
 
-    try walkFiles(td.dir, &ign, &.{"."}, &.{"run"}, &.{}, false, &collector);
+    try walkFiles(std.testing.allocator, td.dir, &ign, &.{"."}, &.{"run"}, &.{}, false, false, &collector);
 
     try std.testing.expectEqual(@as(usize, 1), collector.files.items.len);
     try std.testing.expect(std.mem.endsWith(u8, collector.files.items[0], "src/run.zig"));
