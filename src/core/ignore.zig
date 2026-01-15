@@ -29,6 +29,7 @@ pub const Stack = struct {
         }
 
         try self.load(dir, ".gitignore");
+        try self.load(dir, ".rgignore");
         try self.load(dir, ".ignore");
     }
 
