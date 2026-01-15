@@ -552,10 +552,25 @@ const LineTracker = struct {
 
     fn lineAt(self: *LineTracker, data: []const u8, offset: usize) usize {
         if (offset >= self.pos) {
-            for (data[self.pos..@min(offset, data.len)]) |c| {
-                if (c == '\n') self.line += 1;
+            var i = self.pos;
+            const limit = @min(offset, data.len);
+            
+            // SIMD forward
+            const Vec = @Vector(32, u8);
+            const nl: Vec = @splat('\n');
+            while (i + 32 <= limit) {
+                const chunk: Vec = data[i..][0..32].*;
+                const matches = chunk == nl;
+                self.line += @popCount(@as(u32, @bitCast(matches)));
+                i += 32;
+            }
+            
+            // Scalar tail
+            while (i < limit) : (i += 1) {
+                if (data[i] == '\n') self.line += 1;
             }
         } else {
+            // Backward scan (rarely used but needed for correctness)
             var i = self.pos;
             while (i > offset) {
                 i -= 1;
