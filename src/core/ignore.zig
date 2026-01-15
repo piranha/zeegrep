@@ -144,14 +144,13 @@ fn matchPat(pat: []const u8, kind: glob.PatKind, target: []const u8, full_path: 
 }
 
 fn defaultSkip(rel_path: []const u8) bool {
-    if (std.mem.startsWith(u8, rel_path, ".git")) return true;
-    if (std.mem.startsWith(u8, rel_path, ".zig-cache")) return true;
-    if (std.mem.startsWith(u8, rel_path, ".zig-global-cache")) return true;
-    if (std.mem.startsWith(u8, rel_path, "zig-out")) return true;
-    return std.mem.indexOf(u8, rel_path, "/.git/") != null or
-        std.mem.indexOf(u8, rel_path, "/.zig-cache/") != null or
-        std.mem.indexOf(u8, rel_path, "/.zig-global-cache/") != null or
-        std.mem.indexOf(u8, rel_path, "/zig-out/") != null;
+    // Only skip VCS internals - everything else via ignore files
+    const vcs = .{ ".git", ".hg", ".svn" };
+    inline for (vcs) |v| {
+        if (std.mem.startsWith(u8, rel_path, v)) return true;
+        if (std.mem.indexOf(u8, rel_path, "/" ++ v ++ "/") != null) return true;
+    }
+    return false;
 }
 
 test "stack honors per-dir ignore" {
