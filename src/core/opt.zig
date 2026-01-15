@@ -90,12 +90,32 @@ fn parseInternal(
             const norm_name = normalizeName(name, &name_buf);
 
             // Try global first, then subcommand
-            if (setField(G, g_fields, g_has_meta, global, norm_name, inline_value, args, &i)) {
-                continue;
+            const g_result = setField(G, g_fields, g_has_meta, global, norm_name, inline_value, args, &i);
+            switch (g_result) {
+                .ok => continue,
+                .missing_value => {
+                    std.debug.print("error: option '--{s}' requires a value\n", .{name});
+                    return ParseError.MissingValue;
+                },
+                .invalid_value => {
+                    std.debug.print("error: invalid value for '--{s}'\n", .{name});
+                    return ParseError.InvalidValue;
+                },
+                .not_found => {},
             }
             if (merged and S != void) {
-                if (setField(S, s_fields, s_has_meta, sub, norm_name, inline_value, args, &i)) {
-                    continue;
+                const s_result = setField(S, s_fields, s_has_meta, sub, norm_name, inline_value, args, &i);
+                switch (s_result) {
+                    .ok => continue,
+                    .missing_value => {
+                        std.debug.print("error: option '--{s}' requires a value\n", .{name});
+                        return ParseError.MissingValue;
+                    },
+                    .invalid_value => {
+                        std.debug.print("error: invalid value for '--{s}'\n", .{name});
+                        return ParseError.InvalidValue;
+                    },
+                    .not_found => {},
                 }
             }
             // In merged mode with empty subcommand struct, skip unknown options
@@ -117,12 +137,32 @@ fn parseInternal(
             const inline_value: ?[]const u8 = if (arg.len > 2) arg[2..] else null;
 
             // Try global first, then subcommand
-            if (setFieldByShort(G, g_fields, g_has_meta, global, short, inline_value, args, &i)) {
-                continue;
+            const g_result = setFieldByShort(G, g_fields, g_has_meta, global, short, inline_value, args, &i);
+            switch (g_result) {
+                .ok => continue,
+                .missing_value => {
+                    std.debug.print("error: option '-{c}' requires a value\n", .{short});
+                    return ParseError.MissingValue;
+                },
+                .invalid_value => {
+                    std.debug.print("error: invalid value for '-{c}'\n", .{short});
+                    return ParseError.InvalidValue;
+                },
+                .not_found => {},
             }
             if (merged and S != void) {
-                if (setFieldByShort(S, s_fields, s_has_meta, sub, short, inline_value, args, &i)) {
-                    continue;
+                const s_result = setFieldByShort(S, s_fields, s_has_meta, sub, short, inline_value, args, &i);
+                switch (s_result) {
+                    .ok => continue,
+                    .missing_value => {
+                        std.debug.print("error: option '-{c}' requires a value\n", .{short});
+                        return ParseError.MissingValue;
+                    },
+                    .invalid_value => {
+                        std.debug.print("error: invalid value for '-{c}'\n", .{short});
+                        return ParseError.InvalidValue;
+                    },
+                    .not_found => {},
                 }
             }
             // In merged mode with empty subcommand struct, skip unknown short options
@@ -159,6 +199,8 @@ fn normalizeName(name: []const u8, buf: []u8) []const u8 {
     return buf[0..j];
 }
 
+const FieldResult = enum { not_found, ok, missing_value, invalid_value };
+
 fn setField(
     comptime T: type,
     comptime fields: []const std.builtin.Type.StructField,
@@ -168,14 +210,17 @@ fn setField(
     inline_value: ?[]const u8,
     args: []const []const u8,
     i: *usize,
-) bool {
+) FieldResult {
     inline for (fields) |field| {
         if (std.mem.eql(u8, field.name, name)) {
-            setValue(T, opts, field, has_meta, inline_value, args, i) catch return false;
-            return true;
+            setValue(T, opts, field, has_meta, inline_value, args, i) catch |e| return switch (e) {
+                error.MissingValue => .missing_value,
+                else => .invalid_value,
+            };
+            return .ok;
         }
     }
-    return false;
+    return .not_found;
 }
 
 fn setFieldByShort(
@@ -187,21 +232,24 @@ fn setFieldByShort(
     inline_value: ?[]const u8,
     args: []const []const u8,
     i: *usize,
-) bool {
-    if (!has_meta) return false;
+) FieldResult {
+    if (!has_meta) return .not_found;
 
     inline for (fields) |field| {
         if (@hasField(@TypeOf(T.meta), field.name)) {
             const field_meta = @field(T.meta, field.name);
             if (@hasField(@TypeOf(field_meta), "short")) {
                 if (field_meta.short == short) {
-                    setValue(T, opts, field, has_meta, inline_value, args, i) catch return false;
-                    return true;
+                    setValue(T, opts, field, has_meta, inline_value, args, i) catch |e| return switch (e) {
+                        error.MissingValue => .missing_value,
+                        else => .invalid_value,
+                    };
+                    return .ok;
                 }
             }
         }
     }
-    return false;
+    return .not_found;
 }
 
 fn setValue(

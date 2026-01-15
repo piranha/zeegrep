@@ -26,6 +26,7 @@ pub fn main() !void {
             opt.usage(Options);
             return;
         },
+        error.UnknownOption, error.MissingValue, error.InvalidValue => std.process.exit(1),
         else => return e,
     };
 
@@ -46,6 +47,7 @@ pub fn main() !void {
             opt.usage(Options);
             return;
         },
+        error.UnknownOption, error.MissingValue, error.InvalidValue => std.process.exit(1),
         else => return e,
     };
 
