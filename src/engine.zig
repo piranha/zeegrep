@@ -26,7 +26,11 @@ pub const Pattern = union(enum) {
 };
 
 pub fn compile(allocator: std.mem.Allocator, pat: []const u8, ignore_case: bool, dotall: bool) !Pattern {
-    if (isRegex(pat)) return .{ .regex = try pcre2.compile(allocator, pat, ignore_case, dotall) };
+    return compileOpts(allocator, pat, ignore_case, dotall, false);
+}
+
+pub fn compileOpts(allocator: std.mem.Allocator, pat: []const u8, ignore_case: bool, dotall: bool, force_literal: bool) !Pattern {
+    if (!force_literal and isRegex(pat)) return .{ .regex = try pcre2.compile(allocator, pat, ignore_case, dotall) };
     return .{ .literal = bmh.Matcher.init(pat, ignore_case) };
 }
 

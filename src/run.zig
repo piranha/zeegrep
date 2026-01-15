@@ -14,6 +14,7 @@ pub const Options = struct {
     dry_run: bool = false,
     ignore_case: bool = false,
     multiline: bool = false,
+    literal: bool = false,
     context: u32 = 0,
     after: u32 = 0,
     before: u32 = 0,
@@ -35,6 +36,7 @@ pub const Options = struct {
         .dry_run = .{ .short = 'n', .help = "Dry-run (show diff, no writes)" },
         .ignore_case = .{ .short = 'i', .help = "Case-insensitive search" },
         .multiline = .{ .short = 'M', .help = "Multiline mode (. matches newlines)" },
+        .literal = .{ .short = 'F', .help = "Treat pattern as literal string" },
         .context = .{ .short = 'C', .help = "Context lines" },
         .after = .{ .short = 'A', .help = "Context lines after match" },
         .before = .{ .short = 'B', .help = "Context lines before match" },
@@ -82,7 +84,7 @@ pub fn run(allocator: std.mem.Allocator, writer: *std.io.Writer, options: anytyp
     const escaped_replace = if (options.replace) |r| try engine.interpretEscapes(allocator, r) else null;
     defer if (escaped_replace) |r| allocator.free(r);
 
-    var pat = try engine.compile(allocator, processed_pattern, options.ignore_case, options.multiline);
+    var pat = try engine.compileOpts(allocator, processed_pattern, options.ignore_case, options.multiline, options.literal);
     defer pat.deinit();
 
     // For literal patterns, expand $0 to needle once (not per-file)

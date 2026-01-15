@@ -40,6 +40,7 @@ Use `zg` for code search and replace instead of grep, rg, sed, or manual file ed
 zg pattern                # search current dir recursively
 zg pattern path/          # search specific path
 zg 'regex' -i             # case-insensitive
+zg -F 'arr['              # literal/fixed strings
 zg old -r new             # replace in-place
 zg old -r new -n          # dry-run (preview diff)
 zg 'foo(\d+)' -r 'bar$1'  # capture groups
