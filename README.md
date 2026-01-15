@@ -127,21 +127,16 @@ $ zg oldFunc -r newFunc -n
 
 - Simple/stupid - should be working for 98% of use cases, but shouldn't be overloaded with options.
 - zeegrep reads `.gitignore`, `.rgignore` and `.ignore` files. Binaries are skipped automatically. Some weirdest pattern are not implemented (yet? idk).
-- PCRE2 with JIT is used. Yes you can break it with backtracking, but it's up to you - otherwise it's very fast.
+- PCRE2 with JIT is used. Yes you can break it with backtracking, but it's up to you - otherwise it's quite fast.
 
 ## Speed
 
-Weirdly enough for plenty of usecases it is faster than ripgrep, and I'm not
-absolutely sure why. ArenaAllocator ftw? Somebody who knows better than me
-should explain this.
+In simplest of usecases zeegrep is sometimes even a bit faster than ripgrep, but
+obviously rg has lots of smart optimizations and zg is just a simple little
+app. It tries to be fast enough not to be irritating.
 
-I obviously looked at ripgrep a lot deciding on behavior, and I think in complex
-cases (huge files, multiple patterns, complex regexes) it may be slower... But
-that's not the point! It competes on convenience first (I just want to replace
-sometimes), and then on making LLMs life a little bit easier when possible
-second.
-
-TL;DR: it's quick and convenient.
+It competes on convenience first (I just want to replace a string sometimes),
+and then on making LLMs life a little bit easier when possible second.
 
 ## See Also
 

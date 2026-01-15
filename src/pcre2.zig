@@ -106,14 +106,19 @@ pub const MatchIterator = struct {
     }
 
     pub fn next(self: *MatchIterator) ?Span {
+        return self.nextFrom(self.pos);
+    }
+
+    /// Try to match starting from given position (for prefix optimization)
+    pub fn nextFrom(self: *MatchIterator, start_pos: usize) ?Span {
         const md = self.md orelse return null;
-        if (self.pos > self.subject.len) return null;
+        if (start_pos > self.subject.len) return null;
 
         const rc = c.pcre2_match_8(
             self.code.code.?,
             self.subject.ptr,
             self.subject.len,
-            self.pos,
+            start_pos,
             0,
             md,
             null,
@@ -125,6 +130,11 @@ pub const MatchIterator = struct {
         const end: usize = @intCast(ovec[1]);
         self.pos = if (end > start) end else start + 1;
         return .{ .start = start, .end = end };
+    }
+
+    /// Set position for next iteration (used by optimized wrapper)
+    pub fn setPos(self: *MatchIterator, pos: usize) void {
+        self.pos = pos;
     }
 };
 
