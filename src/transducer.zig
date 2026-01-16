@@ -103,6 +103,34 @@ pub fn Filter(comptime pred: anytype) type {
     };
 }
 
+/// Keep: map + filter in one - keep non-null results (Clojure: keep)
+/// f: fn(T) -> ?U - returns null to skip, value to keep
+pub fn Keep(comptime f: anytype) type {
+    return struct {
+        pub fn apply(comptime Downstream: type) type {
+            return struct {
+                downstream: Downstream,
+
+                const Self = @This();
+
+                pub fn step(self: *Self, item: anytype) !void {
+                    if (f(item)) |result| {
+                        try self.downstream.step(result);
+                    }
+                }
+
+                pub fn finish(self: *Self) !void {
+                    try self.downstream.finish();
+                }
+            };
+        }
+
+        pub fn wrap(comptime Sink: type, sink: Sink) apply(Sink) {
+            return .{ .downstream = sink };
+        }
+    };
+}
+
 /// Take: pass through first N items, then halt
 pub fn Take(comptime n: usize) type {
     return struct {
@@ -888,6 +916,21 @@ test "dedupe" {
 
     try transduce(Dedupe(i32), ToArrayList(i32), sinkFor(i32, &result), &[_]i32{ 1, 1, 2, 2, 2, 3, 1, 1 });
     try testing.expectEqualSlices(i32, &[_]i32{ 1, 2, 3, 1 }, result.items);
+}
+
+test "keep" {
+    // Keep even numbers, double them
+    const evenDouble = struct {
+        fn f(x: i32) ?i32 {
+            return if (@mod(x, 2) == 0) x * 2 else null;
+        }
+    }.f;
+
+    var result = listOf(i32);
+    defer result.deinit(alloc);
+
+    try transduce(Keep(evenDouble), ToArrayList(i32), sinkFor(i32, &result), &[_]i32{ 1, 2, 3, 4, 5, 6 });
+    try testing.expectEqualSlices(i32, &[_]i32{ 4, 8, 12 }, result.items);
 }
 
 test "compose3" {
