@@ -9,6 +9,9 @@ const core_ignore = @import("core/ignore.zig");
 const ansi = @import("core/ansi.zig");
 const opt = @import("core/opt.zig");
 
+const max_file_size = 1 << 30; // 1GB
+const max_parallelism = 3;
+
 pub const Options = struct {
     replace: ?[]const u8 = null,
     dry_run: bool = false,
@@ -73,7 +76,7 @@ pub const Options = struct {
     };
 };
 
-pub fn run(allocator: std.mem.Allocator, writer: *std.io.Writer, options: anytype, pattern: []const u8, paths: []const []const u8) !void {
+pub fn run(allocator: std.mem.Allocator, writer: *std.io.Writer, options: Options, pattern: []const u8, paths: []const []const u8) !void {
     const cwd = std.fs.cwd();
 
     if (options.file_names and options.replace != null) return error.InvalidArgs;
@@ -164,12 +167,11 @@ pub fn run(allocator: std.mem.Allocator, writer: *std.io.Writer, options: anytyp
     const shared_alloc = ts.allocator();
 
     var pool: core_pool.Pool = .{};
-    const n_jobs: usize = @min(3, std.Thread.getCpuCount() catch 3);
+    const n_jobs = @min(max_parallelism, std.Thread.getCpuCount() catch max_parallelism);
     try pool.init(allocator, n_jobs);
     defer pool.deinit();
 
-    var shared = Shared.init(shared_alloc, before, after, use_color, use_heading, processed_replace, writer);
-    defer shared.deinit();
+    var shared = Shared.init(shared_alloc, &pool, before, after, use_color, use_heading, processed_replace, writer);
 
     var scope = pool.scope();
 
@@ -177,21 +179,21 @@ pub fn run(allocator: std.mem.Allocator, writer: *std.io.Writer, options: anytyp
         scope: *core_pool.Scope,
         shared: *Shared,
         pat: *const engine.Pattern,
-        options: @TypeOf(options),
+        opts: Options,
         allocator: std.mem.Allocator,
         cwd: std.fs.Dir,
 
         pub fn onFile(self: *@This(), path: []const u8) void {
             const p = self.allocator.dupe(u8, path) catch return;
-            if (self.options.abs) {
+            if (self.opts.abs) {
                 const abs = self.cwd.realpathAlloc(self.allocator, p) catch {
                     self.allocator.free(p);
                     return;
                 };
                 self.allocator.free(p);
-                self.scope.spawn(Job(@TypeOf(self.options)).run, .{ self.shared, abs, self.options, self.pat });
+                self.scope.spawn(Job.run, .{ self.shared, abs, self.opts, self.pat });
             } else {
-                self.scope.spawn(Job(@TypeOf(self.options)).run, .{ self.shared, p, self.options, self.pat });
+                self.scope.spawn(Job.run, .{ self.shared, p, self.opts, self.pat });
             }
         }
     };
@@ -199,7 +201,7 @@ pub fn run(allocator: std.mem.Allocator, writer: *std.io.Writer, options: anytyp
         .scope = &scope,
         .shared = &shared,
         .pat = &pat,
-        .options = options,
+        .opts = options,
         .allocator = shared_alloc,
         .cwd = cwd,
     };
@@ -224,6 +226,7 @@ const StreamState = struct {
 
 const Shared = struct {
     allocator: std.mem.Allocator,
+    pool: *core_pool.Pool,
     before: u32,
     after: u32,
     color: bool,
@@ -239,12 +242,8 @@ const Shared = struct {
     files_changed: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     had_error: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
-    fn init(allocator: std.mem.Allocator, before: u32, after: u32, color: bool, heading: bool, replace: ?[]const u8, writer: *std.io.Writer) Shared {
-        return .{ .allocator = allocator, .before = before, .after = after, .color = color, .heading = heading, .replace = replace, .writer = writer };
-    }
-
-    fn deinit(self: *Shared) void {
-        _ = self;
+    fn init(allocator: std.mem.Allocator, pool: *core_pool.Pool, before: u32, after: u32, color: bool, heading: bool, replace: ?[]const u8, writer: *std.io.Writer) Shared {
+        return .{ .allocator = allocator, .pool = pool, .before = before, .after = after, .color = color, .heading = heading, .replace = replace, .writer = writer };
     }
 
     fn add(self: *Shared, matches: usize, repls: usize, changed: bool) void {
@@ -275,115 +274,102 @@ const Shared = struct {
     }
 };
 
-fn Job(comptime Opts: type) type {
-    return struct {
-        // Thread-local arena - reused across jobs, reset between them
-        threadlocal var tl_arena: ?std.heap.ArenaAllocator = null;
+const Job = struct {
+    fn run(thread_id: usize, shared: *Shared, path: []const u8, options: Options, pat: *const engine.Pattern) void {
+        defer shared.allocator.free(path); // path was duped by walker
+        const arena = shared.pool.arena(thread_id);
+        defer _ = arena.reset(.retain_capacity);
+        work(arena.allocator(), shared, path, options, pat) catch |e| {
+            if (options.debug) debugSkip(path, @errorName(e));
+            shared.fail();
+        };
+    }
 
-        fn getArena() *std.heap.ArenaAllocator {
-            if (tl_arena == null) {
-                tl_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-            }
-            return &tl_arena.?;
-        }
+    fn debugSkip(path: []const u8, reason: []const u8) void {
+        std.debug.print("DEBUG: {s}: {s}\n", .{ path, reason });
+    }
 
-        fn run(shared: *Shared, path: []const u8, options: Opts, pat: *const engine.Pattern) void {
-            defer shared.allocator.free(path); // path was duped by walker
-            const arena = getArena();
-            defer _ = arena.reset(.retain_capacity);
-            work(arena.allocator(), shared, path, options, pat) catch |e| {
-                if (options.debug) debugSkip(path, @errorName(e));
-                shared.fail();
-            };
-        }
-
-        fn debugSkip(path: []const u8, reason: []const u8) void {
-            std.debug.print("DEBUG: {s}: {s}\n", .{ path, reason });
-        }
-
-        fn work(tmp: std.mem.Allocator, shared: *Shared, path: []const u8, options: Opts, pat: *const engine.Pattern) !void {
-            if (options.file_names) {
-                if (!engine.matchAny(pat, path, options.ignore_case)) return;
-                const n = engine.countMatches(pat, path, options.ignore_case);
-                shared.add(n, 0, false);
-                if (options.count and !options.quiet) {
-                    var buf: std.ArrayListUnmanaged(u8) = .{};
-                    const w = buf.writer(tmp);
-                    try w.print("{f}:{f}\n", .{ ansi.styled(shared.color, .path, path), ansi.styled(shared.color, .line_no, n) });
-                    shared.output(buf.items);
-                    return;
-                }
-                if (!options.quiet and !options.count) {
-                    var buf: std.ArrayListUnmanaged(u8) = .{};
-                    const w = buf.writer(tmp);
-                    try w.print("{f}\n", .{ansi.styled(shared.color, .path, path)});
-                    shared.output(buf.items);
-                    return;
-                }
+    fn work(tmp: std.mem.Allocator, shared: *Shared, path: []const u8, options: Options, pat: *const engine.Pattern) !void {
+        if (options.file_names) {
+            if (!engine.matchAny(pat, path, options.ignore_case)) return;
+            const n = engine.countMatches(pat, path, options.ignore_case);
+            shared.add(n, 0, false);
+            if (options.count and !options.quiet) {
+                var buf: std.ArrayListUnmanaged(u8) = .{};
+                const w = buf.writer(tmp);
+                try w.print("{f}:{f}\n", .{ ansi.styled(shared.color, .path, path), ansi.styled(shared.color, .line_no, n) });
+                shared.output(buf.items);
                 return;
             }
-
-            var f = std.fs.cwd().openFile(path, .{}) catch |e| {
-                if (options.debug) debugSkip(path, @errorName(e));
-                return;
-            };
-            defer f.close();
-
-            const stat = f.stat() catch |e| {
-                if (options.debug) debugSkip(path, @errorName(e));
-                return;
-            };
-            if (stat.size == 0) return;
-            if (stat.size > 1024 * 1024 * 1024) {
-                if (options.debug) debugSkip(path, "file too large (>1GB)");
+            if (!options.quiet and !options.count) {
+                var buf: std.ArrayListUnmanaged(u8) = .{};
+                const w = buf.writer(tmp);
+                try w.print("{f}\n", .{ansi.styled(shared.color, .path, path)});
+                shared.output(buf.items);
                 return;
             }
-
-            const file_data = mapFile(tmp, f, stat.size) catch |e| {
-                if (options.debug) debugSkip(path, @errorName(e));
-                return;
-            };
-            defer unmapFile(tmp, file_data);
-            const data = file_data.ptr;
-
-            if (isBinary(data)) {
-                if (options.debug) debugSkip(path, "binary file");
-                return;
-            }
-
-            if (shared.replace) |repl| {
-                const rr = try engine.replaceAll(tmp, pat, data, repl, options.ignore_case);
-                if (rr.n == 0) return;
-
-                if (!options.dry_run) try writeAtomic(tmp, path, rr.out);
-
-                shared.add(0, rr.n, true);
-                if (options.dry_run and !options.quiet) {
-                    var buf: std.ArrayListUnmanaged(u8) = .{};
-                    _ = try diff.printChangedLines(buf.writer(tmp), shared.color, path, data, rr.out, shared.before, shared.after);
-                    shared.output(buf.items);
-                    return;
-                }
-                return;
-            }
-
-            const has_context = shared.before > 0 or shared.after > 0;
-
-            // Stream matches to buffer, then output
-            var out: std.ArrayListUnmanaged(u8) = .{};
-            const result = try streamMatches(out.writer(tmp), shared.color, shared.heading, has_context, path, pat, data, shared.before, shared.after, options.ignore_case, options.quiet or options.count, null);
-            if (result.match_count == 0) return;
-            shared.add(result.match_count, 0, false);
-            if (options.quiet) return;
-            if (options.count) {
-                out.clearRetainingCapacity();
-                try out.writer(tmp).print("{f}:{f}\n", .{ ansi.styled(shared.color, .path, path), ansi.styled(shared.color, .line_no, result.match_count) });
-            }
-            if (out.items.len > 0) shared.output(out.items);
             return;
         }
-    };
-}
+
+        var f = std.fs.cwd().openFile(path, .{}) catch |e| {
+            if (options.debug) debugSkip(path, @errorName(e));
+            return;
+        };
+        defer f.close();
+
+        const stat = f.stat() catch |e| {
+            if (options.debug) debugSkip(path, @errorName(e));
+            return;
+        };
+        if (stat.size == 0) return;
+        if (stat.size > max_file_size) {
+            if (options.debug) debugSkip(path, "file too large (>1GB)");
+            return;
+        }
+
+        const file_data = mapFile(f, stat.size) catch |e| {
+            if (options.debug) debugSkip(path, @errorName(e));
+            return;
+        };
+        defer unmapFile(file_data);
+        const data = file_data.ptr;
+
+        if (isBinary(data)) {
+            if (options.debug) debugSkip(path, "binary file");
+            return;
+        }
+
+        if (shared.replace) |repl| {
+            const rr = try engine.replaceAll(tmp, pat, data, repl, options.ignore_case);
+            if (rr.n == 0) return;
+
+            if (!options.dry_run) try writeAtomic(tmp, path, rr.out);
+
+            shared.add(0, rr.n, true);
+            if (options.dry_run and !options.quiet) {
+                var buf: std.ArrayListUnmanaged(u8) = .{};
+                _ = try diff.printChangedLines(buf.writer(tmp), shared.color, path, data, rr.out, shared.before, shared.after);
+                shared.output(buf.items);
+                return;
+            }
+            return;
+        }
+
+        const has_context = shared.before > 0 or shared.after > 0;
+
+        // Stream matches to buffer, then output
+        var out: std.ArrayListUnmanaged(u8) = .{};
+        const match_count = try streamMatches(out.writer(tmp), shared.color, shared.heading, has_context, path, pat, data, shared.before, shared.after, options.ignore_case, options.quiet or options.count, null);
+        if (match_count == 0) return;
+        shared.add(match_count, 0, false);
+        if (options.quiet) return;
+        if (options.count) {
+            out.clearRetainingCapacity();
+            try out.writer(tmp).print("{f}:{f}\n", .{ ansi.styled(shared.color, .path, path), ansi.styled(shared.color, .line_no, match_count) });
+        }
+        if (out.items.len > 0) shared.output(out.items);
+    }
+};
 
 /// Single-threaded file processing for sorted mode - streams directly to writer
 fn processFile(
@@ -391,7 +377,7 @@ fn processFile(
     state: *StreamState,
     path: []const u8,
     pat: *const engine.Pattern,
-    options: anytype,
+    options: Options,
     color: bool,
     heading: bool,
     before: u32,
@@ -409,7 +395,7 @@ fn processFileInner(
     state: *StreamState,
     path: []const u8,
     pat: *const engine.Pattern,
-    options: anytype,
+    options: Options,
     color: bool,
     heading: bool,
     before: u32,
@@ -436,10 +422,10 @@ fn processFileInner(
 
     const stat = f.stat() catch return;
     if (stat.size == 0) return;
-    if (stat.size > 1024 * 1024 * 1024) return;
+    if (stat.size > max_file_size) return;
 
-    const file_data = mapFile(tmp, f, stat.size) catch return;
-    defer unmapFile(tmp, file_data);
+    const file_data = mapFile(f, stat.size) catch return;
+    defer unmapFile(file_data);
     const data = file_data.ptr;
 
     if (isBinary(data)) return;
@@ -462,18 +448,18 @@ fn processFileInner(
     const has_context = before > 0 or after > 0;
 
     if (options.count) {
-        const result = try streamMatches(writer, color, heading, has_context, path, pat, data, before, after, options.ignore_case, true, &state.first_out);
-        if (result.match_count == 0) return;
-        state.total_matches += result.match_count;
+        const match_count = try streamMatches(writer, color, heading, has_context, path, pat, data, before, after, options.ignore_case, true, &state.first_out);
+        if (match_count == 0) return;
+        state.total_matches += match_count;
         if (options.quiet) return;
         try writeSeparator(state, writer, color, heading, before, after);
-        try writer.print("{f}:{f}\n", .{ ansi.styled(color, .path, path), ansi.styled(color, .line_no, result.match_count) });
+        try writer.print("{f}:{f}\n", .{ ansi.styled(color, .path, path), ansi.styled(color, .line_no, match_count) });
         return;
     }
 
-    const result = try streamMatches(writer, color, heading, has_context, path, pat, data, before, after, options.ignore_case, options.quiet, &state.first_out);
-    if (result.match_count == 0) return;
-    state.total_matches += result.match_count;
+    const match_count = try streamMatches(writer, color, heading, has_context, path, pat, data, before, after, options.ignore_case, options.quiet, &state.first_out);
+    if (match_count == 0) return;
+    state.total_matches += match_count;
     // streamMatches already wrote output with separators
 }
 
@@ -502,7 +488,7 @@ fn streamMatches(
     ignore_case: bool,
     count_only: bool,
     first_out: ?*bool,
-) !struct { match_count: usize } {
+) !usize {
     var it = engine.MatchIterator.init(pat, data);
     defer it.deinit();
 
@@ -551,8 +537,8 @@ fn streamMatches(
             const ctx_limit = if (before > 0 and before < start_line) start_line - before else start_line;
             var ctx_line = last_emitted + 1;
             while (ctx_line < ctx_limit and pending_after > 0) : (ctx_line += 1) {
-                if (lineAtIndex(data, ctx_line)) |le| {
-                    try writeContextLine(writer, color, heading, path, ctx_line, le.text, &wrote_heading);
+                if (lineAtIndex(data, ctx_line)) |text| {
+                    try writeContextLine(writer, color, heading, path, ctx_line, text, &wrote_heading);
                     last_emitted = ctx_line;
                 }
                 pending_after -= 1;
@@ -571,8 +557,8 @@ fn streamMatches(
             var ctx_line = ctx_start;
             while (ctx_line < start_line) : (ctx_line += 1) {
                 if (ctx_line > last_emitted) {
-                    if (lineAtIndex(data, ctx_line)) |le| {
-                        try writeContextLine(writer, color, heading, path, ctx_line, le.text, &wrote_heading);
+                    if (lineAtIndex(data, ctx_line)) |text| {
+                        try writeContextLine(writer, color, heading, path, ctx_line, text, &wrote_heading);
                         last_emitted = ctx_line;
                     }
                 }
@@ -619,14 +605,14 @@ fn streamMatches(
     if (!count_only and pending_after > 0 and last_emitted > 0) {
         var ctx_line = last_emitted + 1;
         while (pending_after > 0) : (pending_after -= 1) {
-            if (lineAtIndex(data, ctx_line)) |le| {
-                try writeContextLine(writer, color, heading, path, ctx_line, le.text, &wrote_heading);
+            if (lineAtIndex(data, ctx_line)) |text| {
+                try writeContextLine(writer, color, heading, path, ctx_line, text, &wrote_heading);
                 ctx_line += 1;
             } else break;
         }
     }
 
-    return .{ .match_count = match_count };
+    return match_count;
 }
 
 fn writeContextLine(writer: anytype, color: bool, heading: bool, path: []const u8, line_no: usize, text: []const u8, wrote_heading: *bool) !void {
@@ -651,20 +637,19 @@ fn writeMatchLine(writer: anytype, color: bool, heading: bool, path: []const u8,
     try writer.writeByte('\n');
 }
 
-fn lineAtIndex(data: []const u8, line_no: usize) ?struct { text: []const u8 } {
+fn lineAtIndex(data: []const u8, line_no: usize) ?[]const u8 {
     var current_line: usize = 1;
     var start: usize = 0;
     for (data, 0..) |c, i| {
         if (current_line == line_no) {
             const end = std.mem.indexOfScalarPos(u8, data, i, '\n') orelse data.len;
-            return .{ .text = data[start..end] };
+            return data[start..end];
         }
         if (c == '\n') {
             current_line += 1;
             start = i + 1;
         }
     }
-    // Line beyond EOF
     return null;
 }
 
@@ -731,8 +716,7 @@ const FileData = struct {
     section_handle: if (builtin.os.tag == .windows) std.os.windows.HANDLE else void = if (builtin.os.tag == .windows) undefined else {},
 };
 
-fn mapFile(allocator: std.mem.Allocator, f: std.fs.File, size: u64) !FileData {
-    _ = allocator;
+fn mapFile(f: std.fs.File, size: u64) !FileData {
     if (comptime builtin.os.tag == .windows) {
         const w = std.os.windows;
         var section_handle: w.HANDLE = undefined;
@@ -774,8 +758,7 @@ fn mapFile(allocator: std.mem.Allocator, f: std.fs.File, size: u64) !FileData {
     }
 }
 
-fn unmapFile(allocator: std.mem.Allocator, fd: FileData) void {
-    _ = allocator;
+fn unmapFile(fd: FileData) void {
     if (comptime builtin.os.tag == .windows) {
         const w = std.os.windows;
         _ = w.ntdll.NtUnmapViewOfSection(w.GetCurrentProcess(), @ptrFromInt(@intFromPtr(fd.ptr.ptr)));
