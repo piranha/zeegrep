@@ -139,23 +139,24 @@ pub fn run(allocator: std.mem.Allocator, writer: *std.io.Writer, options: anytyp
         }.lt);
 
         // Use transducer pipeline
+        const search_opts = search.SearchOptions{
+            .pat = &pat,
+            .replace = processed_replace,
+            .before = before,
+            .after = after,
+            .color = use_color,
+            .heading = use_heading,
+            .ignore_case = options.ignore_case,
+            .quiet = options.quiet,
+            .count = options.count,
+            .file_names = options.file_names,
+            .dry_run = options.dry_run,
+            .debug = options.debug,
+        };
         const result = search.search(
             collected_paths.items,
             writer,
-            .{
-                .pat = &pat,
-                .replace = processed_replace,
-                .before = before,
-                .after = after,
-                .color = use_color,
-                .heading = use_heading,
-                .ignore_case = options.ignore_case,
-                .quiet = options.quiet,
-                .count = options.count,
-                .file_names = options.file_names,
-                .dry_run = options.dry_run,
-                .debug = options.debug,
-            },
+            &search_opts,
         ) catch |err| switch (err) {
             error.OutputFailed => return error.JobFailed,
             else => return err,
@@ -168,59 +169,63 @@ pub fn run(allocator: std.mem.Allocator, writer: *std.io.Writer, options: anytyp
         return;
     }
 
-    // Parallel mode
-    var ts = std.heap.ThreadSafeAllocator{ .child_allocator = allocator };
-    const shared_alloc = ts.allocator();
-
-    var pool: core_pool.Pool = .{};
-    const n_jobs: usize = @min(3, std.Thread.getCpuCount() catch 3);
-    try pool.init(allocator, n_jobs);
-    defer pool.deinit();
-
-    var shared = Shared.init(shared_alloc, before, after, use_color, use_heading, processed_replace, writer);
-    defer shared.deinit();
-
-    var scope = pool.scope();
-
-    const Walker = struct {
-        scope: *core_pool.Scope,
-        shared: *Shared,
-        pat: *const engine.Pattern,
-        options: @TypeOf(options),
-        allocator: std.mem.Allocator,
-        cwd: std.fs.Dir,
-
-        pub fn onFile(self: *@This(), path: []const u8) void {
-            const p = self.allocator.dupe(u8, path) catch return;
-            if (self.options.abs) {
-                const abs = self.cwd.realpathAlloc(self.allocator, p) catch {
-                    self.allocator.free(p);
-                    return;
-                };
-                self.allocator.free(p);
-                self.scope.spawn(Job(@TypeOf(self.options)).run, .{ self.shared, abs, self.options, self.pat });
-            } else {
-                self.scope.spawn(Job(@TypeOf(self.options)).run, .{ self.shared, p, self.options, self.pat });
-            }
-        }
-    };
-    var walker = Walker{
-        .scope = &scope,
-        .shared = &shared,
-        .pat = &pat,
-        .options = options,
-        .allocator = shared_alloc,
-        .cwd = cwd,
-    };
-    try core_walk.walkFiles(allocator, cwd, &ign, paths, options.include.constSlice(), options.exclude.constSlice(), options.hidden, false, &walker);
-    scope.wait();
-
-    if (options.replace != null and !options.quiet) {
-        try writer.print("{d} files, {d} replacements\n", .{ shared.files_changed.load(.monotonic), shared.total_repls.load(.monotonic) });
+    // Parallel mode using transducer pipeline
+    // First collect paths (walk doesn't return iterator, uses callback)
+    var collected_paths: std.ArrayListUnmanaged([]const u8) = .{};
+    defer {
+        for (collected_paths.items) |p| allocator.free(p);
+        collected_paths.deinit(allocator);
     }
 
-    if (shared.had_error.load(.monotonic)) return error.JobFailed;
-    if (shared.total_matches.load(.monotonic) == 0 and shared.total_repls.load(.monotonic) == 0) return error.NoMatches;
+    const PathCollector = struct {
+        paths: *std.ArrayListUnmanaged([]const u8),
+        alloc: std.mem.Allocator,
+        cwd: std.fs.Dir,
+        use_abs: bool,
+
+        pub fn onFile(self: *@This(), path: []const u8) void {
+            const p = if (self.use_abs)
+                self.cwd.realpathAlloc(self.alloc, path) catch return
+            else
+                self.alloc.dupe(u8, path) catch return;
+            self.paths.append(self.alloc, p) catch self.alloc.free(p);
+        }
+    };
+    var collector = PathCollector{ .paths = &collected_paths, .alloc = allocator, .cwd = cwd, .use_abs = options.abs };
+    try core_walk.walkFiles(allocator, cwd, &ign, paths, options.include.constSlice(), options.exclude.constSlice(), options.hidden, false, &collector);
+
+    // Use parallel transducer pipeline
+    var mutex = std.Thread.Mutex{};
+    const search_opts = search.SearchOptions{
+        .pat = &pat,
+        .replace = processed_replace,
+        .before = before,
+        .after = after,
+        .color = use_color,
+        .heading = use_heading,
+        .ignore_case = options.ignore_case,
+        .quiet = options.quiet,
+        .count = options.count,
+        .file_names = options.file_names,
+        .dry_run = options.dry_run,
+        .debug = options.debug,
+    };
+    const result = search.searchParallel(
+        4,   // workers
+        64,  // queue size
+        collected_paths.items,
+        writer,
+        &search_opts,
+        &mutex,
+    ) catch |err| switch (err) {
+        error.OutputFailed => return error.JobFailed,
+        else => return err,
+    };
+
+    if (options.replace != null and !options.quiet) {
+        try writer.print("{d} files, {d} replacements\n", .{ result.files_changed, result.replacements });
+    }
+    if (result.matches == 0 and result.replacements == 0) return error.NoMatches;
 }
 
 const StreamState = struct {

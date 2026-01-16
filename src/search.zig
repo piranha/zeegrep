@@ -75,30 +75,32 @@ pub const SearchOptions = struct {
 // File Processing Transducer
 // ============================================================================
 
+// Thread-local arena, shared across all FileProcessor instances in a thread
+threadlocal var tl_arena: ?std.heap.ArenaAllocator = null;
+// Thread-local opts pointer, set before processing
+threadlocal var tl_opts: ?*const SearchOptions = null;
+
+fn getArena() *std.heap.ArenaAllocator {
+    if (tl_arena == null) {
+        tl_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    }
+    return &tl_arena.?;
+}
+
 /// A transducer that processes files. Takes path, emits FileResult.
+/// Uses thread-local storage for opts to work with Parallel transducer.
 pub const FileProcessor = struct {
     pub fn apply(comptime Downstream: type) type {
         return struct {
             downstream: Downstream,
-            opts: SearchOptions,
 
             const Self = @This();
-
-            // Thread-local arena, reset after each file
-            threadlocal var tl_arena: ?std.heap.ArenaAllocator = null;
-
-            fn getArena() *std.heap.ArenaAllocator {
-                if (tl_arena == null) {
-                    tl_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-                }
-                return &tl_arena.?;
-            }
 
             pub fn step(self: *Self, path: []const u8) !void {
                 const arena = getArena();
                 defer _ = arena.reset(.retain_capacity);
 
-                if (self.processFile(arena.allocator(), path)) |result| {
+                if (processFile(arena.allocator(), path)) |result| {
                     try self.downstream.step(result);
                 }
             }
@@ -106,91 +108,92 @@ pub const FileProcessor = struct {
             pub fn finish(self: *Self) !void {
                 try self.downstream.finish();
             }
-
-            fn processFile(self: *Self, tmp: std.mem.Allocator, path: []const u8) ?FileResult {
-                return self.processInner(tmp, path) catch |e| {
-                    if (self.opts.debug) {
-                        std.debug.print("DEBUG: {s}: {s}\n", .{ path, @errorName(e) });
-                    }
-                    return null;
-                };
-            }
-
-            fn processInner(self: *Self, tmp: std.mem.Allocator, path: []const u8) !?FileResult {
-                const opts = self.opts;
-
-                // File name matching mode
-                if (opts.file_names) {
-                    if (!engine.matchAny(opts.pat, path, opts.ignore_case)) return null;
-                    const n = engine.countMatches(opts.pat, path, opts.ignore_case);
-
-                    if (opts.quiet) return FileResult{ .output = "", .matches = n, .replacements = 0, .changed = false };
-
-                    var buf: std.ArrayListUnmanaged(u8) = .{};
-                    const w = buf.writer(tmp);
-                    if (opts.count) {
-                        try w.print("{f}:{f}\n", .{ ansi.styled(opts.color, .path, path), ansi.styled(opts.color, .line_no, n) });
-                    } else {
-                        try w.print("{f}\n", .{ ansi.styled(opts.color, .path, path) });
-                    }
-                    const output = try tmp.dupe(u8, buf.items);
-                    return FileResult{ .output = output, .matches = n, .replacements = 0, .changed = false };
-                }
-
-                // Open and map file
-                var f = std.fs.cwd().openFile(path, .{}) catch return null;
-                defer f.close();
-
-                const stat = f.stat() catch return null;
-                if (stat.size == 0) return null;
-                if (stat.size > 1024 * 1024 * 1024) return null; // >1GB
-
-                const file_data = mapFile(tmp, f, stat.size) catch return null;
-                defer unmapFile(tmp, file_data);
-                const data = file_data.ptr;
-
-                if (isBinary(data)) return null;
-
-                // Replace mode
-                if (opts.replace) |repl| {
-                    const rr = try engine.replaceAll(tmp, opts.pat, data, repl, opts.ignore_case);
-                    if (rr.n == 0) return null;
-
-                    if (!opts.dry_run) try writeAtomic(tmp, path, rr.out);
-
-                    if (opts.quiet) return FileResult{ .output = "", .matches = 0, .replacements = rr.n, .changed = true };
-
-                    if (opts.dry_run) {
-                        var buf: std.ArrayListUnmanaged(u8) = .{};
-                        _ = try diff.printChangedLines(buf.writer(tmp), opts.color, path, data, rr.out, opts.before, opts.after);
-                        const output = try tmp.dupe(u8, buf.items);
-                        return FileResult{ .output = output, .matches = 0, .replacements = rr.n, .changed = true };
-                    }
-
-                    return FileResult{ .output = "", .matches = 0, .replacements = rr.n, .changed = true };
-                }
-
-                // Search mode
-                const has_context = opts.before > 0 or opts.after > 0;
-                var out: std.ArrayListUnmanaged(u8) = .{};
-                const result = try streamMatches(out.writer(tmp), opts.color, opts.heading, has_context, path, opts.pat, data, opts.before, opts.after, opts.ignore_case, opts.quiet or opts.count, null);
-
-                if (result.match_count == 0) return null;
-                if (opts.quiet) return FileResult{ .output = "", .matches = result.match_count, .replacements = 0, .changed = false };
-
-                if (opts.count) {
-                    out.clearRetainingCapacity();
-                    try out.writer(tmp).print("{f}:{f}\n", .{ ansi.styled(opts.color, .path, path), ansi.styled(opts.color, .line_no, result.match_count) });
-                }
-
-                const output = try tmp.dupe(u8, out.items);
-                return FileResult{ .output = output, .matches = result.match_count, .replacements = 0, .changed = false };
-            }
         };
     }
 
-    pub fn wrap(comptime Sink: type, sink: Sink, opts: SearchOptions) apply(Sink) {
-        return .{ .downstream = sink, .opts = opts };
+    pub fn wrap(comptime Sink: type, sink: Sink) apply(Sink) {
+        return .{ .downstream = sink };
+    }
+
+    fn processFile(tmp: std.mem.Allocator, path: []const u8) ?FileResult {
+        return processInner(tmp, path) catch |e| {
+            const opts = tl_opts orelse return null;
+            if (opts.debug) {
+                std.debug.print("DEBUG: {s}: {s}\n", .{ path, @errorName(e) });
+            }
+            return null;
+        };
+    }
+
+    fn processInner(tmp: std.mem.Allocator, path: []const u8) !?FileResult {
+        const opts = tl_opts orelse return null;
+
+        // File name matching mode
+        if (opts.file_names) {
+            if (!engine.matchAny(opts.pat, path, opts.ignore_case)) return null;
+            const n = engine.countMatches(opts.pat, path, opts.ignore_case);
+
+            if (opts.quiet) return FileResult{ .output = "", .matches = n, .replacements = 0, .changed = false };
+
+            var buf: std.ArrayListUnmanaged(u8) = .{};
+            const w = buf.writer(tmp);
+            if (opts.count) {
+                try w.print("{f}:{f}\n", .{ ansi.styled(opts.color, .path, path), ansi.styled(opts.color, .line_no, n) });
+            } else {
+                try w.print("{f}\n", .{ ansi.styled(opts.color, .path, path) });
+            }
+            const output = try tmp.dupe(u8, buf.items);
+            return FileResult{ .output = output, .matches = n, .replacements = 0, .changed = false };
+        }
+
+        // Open and map file
+        var f = std.fs.cwd().openFile(path, .{}) catch return null;
+        defer f.close();
+
+        const stat = f.stat() catch return null;
+        if (stat.size == 0) return null;
+        if (stat.size > 1024 * 1024 * 1024) return null; // >1GB
+
+        const file_data = mapFile(tmp, f, stat.size) catch return null;
+        defer unmapFile(tmp, file_data);
+        const data = file_data.ptr;
+
+        if (isBinary(data)) return null;
+
+        // Replace mode
+        if (opts.replace) |repl| {
+            const rr = try engine.replaceAll(tmp, opts.pat, data, repl, opts.ignore_case);
+            if (rr.n == 0) return null;
+
+            if (!opts.dry_run) try writeAtomic(tmp, path, rr.out);
+
+            if (opts.quiet) return FileResult{ .output = "", .matches = 0, .replacements = rr.n, .changed = true };
+
+            if (opts.dry_run) {
+                var buf: std.ArrayListUnmanaged(u8) = .{};
+                _ = try diff.printChangedLines(buf.writer(tmp), opts.color, path, data, rr.out, opts.before, opts.after);
+                const output = try tmp.dupe(u8, buf.items);
+                return FileResult{ .output = output, .matches = 0, .replacements = rr.n, .changed = true };
+            }
+
+            return FileResult{ .output = "", .matches = 0, .replacements = rr.n, .changed = true };
+        }
+
+        // Search mode
+        const has_context = opts.before > 0 or opts.after > 0;
+        var out: std.ArrayListUnmanaged(u8) = .{};
+        const result = try streamMatches(out.writer(tmp), opts.color, opts.heading, has_context, path, opts.pat, data, opts.before, opts.after, opts.ignore_case, opts.quiet or opts.count, null);
+
+        if (result.match_count == 0) return null;
+        if (opts.quiet) return FileResult{ .output = "", .matches = result.match_count, .replacements = 0, .changed = false };
+
+        if (opts.count) {
+            out.clearRetainingCapacity();
+            try out.writer(tmp).print("{f}:{f}\n", .{ ansi.styled(opts.color, .path, path), ansi.styled(opts.color, .line_no, result.match_count) });
+        }
+
+        const output = try tmp.dupe(u8, out.items);
+        return FileResult{ .output = output, .matches = result.match_count, .replacements = 0, .changed = false };
     }
 };
 
@@ -202,7 +205,7 @@ pub const FileProcessor = struct {
 pub fn OutputSink(comptime Writer: type) type {
     return struct {
         writer: Writer,
-        opts: SearchOptions,
+        opts: *const SearchOptions,
         mutex: ?*std.Thread.Mutex = null, // null for single-threaded
 
         // Stats
@@ -297,12 +300,22 @@ const streamMatches = run_impl.streamMatches;
 // Public API
 // ============================================================================
 
-/// Run search/replace on a list of paths using transducer pipeline
+pub const SearchResult = struct { 
+    matches: usize, 
+    replacements: usize, 
+    files_changed: usize,
+};
+
+/// Run search/replace on a list of paths using transducer pipeline (sequential)
 pub fn search(
     paths: []const []const u8,
     writer: anytype,
-    opts: SearchOptions,
-) !struct { matches: usize, replacements: usize, files_changed: usize } {
+    opts: *const SearchOptions,
+) !SearchResult {
+    // Set thread-local opts for FileProcessor
+    tl_opts = opts;
+    defer tl_opts = null;
+
     const Sink = OutputSink(@TypeOf(writer));
 
     const sink = Sink{
@@ -310,10 +323,88 @@ pub fn search(
         .opts = opts,
     };
 
-    var pipeline = FileProcessor.wrap(Sink, sink, opts);
+    var pipeline = FileProcessor.wrap(Sink, sink);
 
     for (paths) |path| {
         pipeline.step(path) catch |err| {
+            if (err == error.TransducerHalt) break;
+            return err;
+        };
+    }
+    try pipeline.finish();
+
+    if (pipeline.downstream.had_error) return error.OutputFailed;
+
+    return .{
+        .matches = pipeline.downstream.total_matches,
+        .replacements = pipeline.downstream.total_repls,
+        .files_changed = pipeline.downstream.files_changed,
+    };
+}
+
+/// Work item for parallel processing - bundles path with opts pointer
+pub const WorkItem = struct {
+    path: []const u8,
+    opts: *const SearchOptions,
+};
+
+/// A transducer that processes WorkItems (path + opts).
+pub const WorkItemProcessor = struct {
+    pub fn apply(comptime Downstream: type) type {
+        return struct {
+            downstream: Downstream,
+
+            const Self = @This();
+
+            pub fn step(self: *Self, item: WorkItem) !void {
+                // Set thread-local opts for this worker
+                tl_opts = item.opts;
+
+                // NOTE: We don't reset arena here because output slices are stored
+                // in result_queue and consumed asynchronously by main thread.
+                // Arena accumulates during worker lifetime - acceptable trade-off.
+                const arena = getArena();
+
+                if (FileProcessor.processFile(arena.allocator(), item.path)) |result| {
+                    try self.downstream.step(result);
+                }
+            }
+
+            pub fn finish(self: *Self) !void {
+                try self.downstream.finish();
+            }
+        };
+    }
+
+    pub fn wrap(comptime Sink: type, sink: Sink) apply(Sink) {
+        return .{ .downstream = sink };
+    }
+};
+
+/// Run search/replace in parallel using transducer pipeline.
+/// Uses Parallel transducer with n_workers threads.
+pub fn searchParallel(
+    comptime n_workers: usize,
+    comptime queue_size: usize,
+    paths: []const []const u8,
+    writer: anytype,
+    opts: *const SearchOptions,
+    mutex: *std.Thread.Mutex,
+) !SearchResult {
+    const Sink = OutputSink(@TypeOf(writer));
+    const ParallelPipeline = xf.Parallel(n_workers, queue_size, WorkItemProcessor, WorkItem, FileResult);
+
+    const sink = Sink{
+        .writer = writer,
+        .opts = opts,
+        .mutex = mutex,
+    };
+
+    var pipeline = ParallelPipeline.wrap(Sink, sink);
+
+    // Feed work items (path bundled with opts pointer)
+    for (paths) |path| {
+        pipeline.step(.{ .path = path, .opts = opts }) catch |err| {
             if (err == error.TransducerHalt) break;
             return err;
         };
@@ -357,23 +448,24 @@ test "search basic" {
 
     const paths = [_][]const u8{path};
 
+    const opts = SearchOptions{
+        .pat = &pat,
+        .replace = null,
+        .before = 0,
+        .after = 0,
+        .color = false,
+        .heading = false,
+        .ignore_case = false,
+        .quiet = false,
+        .count = false,
+        .file_names = false,
+        .dry_run = false,
+        .debug = false,
+    };
     const result = try search(
         &paths,
         output.writer(alloc),
-        .{
-            .pat = &pat,
-            .replace = null,
-            .before = 0,
-            .after = 0,
-            .color = false,
-            .heading = false,
-            .ignore_case = false,
-            .quiet = false,
-            .count = false,
-            .file_names = false,
-            .dry_run = false,
-            .debug = false,
-        },
+        &opts,
     );
 
     try std.testing.expectEqual(@as(usize, 2), result.matches);
