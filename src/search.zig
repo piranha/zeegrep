@@ -55,9 +55,10 @@ pub const FileResult = struct {
     changed: bool,
 };
 
-/// Comptime options for pipeline construction
-pub const PipelineOptions = struct {
-    replace: bool,
+/// Options for pipeline (runtime)
+pub const SearchOptions = struct {
+    pat: *const engine.Pattern,
+    replace: ?[]const u8,
     before: u32,
     after: u32,
     color: bool,
@@ -70,146 +71,139 @@ pub const PipelineOptions = struct {
     debug: bool,
 };
 
-/// Runtime context for processing
-pub const RuntimeContext = struct {
-    pat: *const engine.Pattern,
-    replace_str: ?[]const u8,
-};
-
 // ============================================================================
 // File Processing Transducer
 // ============================================================================
 
 /// A transducer that processes files. Takes path, emits FileResult.
-/// Runtime context is stored in the transducer instance.
-pub fn FileProcessor(comptime opts: PipelineOptions) type {
-    return struct {
-        pub fn apply(comptime Downstream: type) type {
-            return struct {
-                downstream: Downstream,
-                ctx: RuntimeContext,
+pub const FileProcessor = struct {
+    pub fn apply(comptime Downstream: type) type {
+        return struct {
+            downstream: Downstream,
+            opts: SearchOptions,
 
-                const Self = @This();
+            const Self = @This();
 
-                // Thread-local arena, reset after each file
-                threadlocal var tl_arena: ?std.heap.ArenaAllocator = null;
+            // Thread-local arena, reset after each file
+            threadlocal var tl_arena: ?std.heap.ArenaAllocator = null;
 
-                fn getArena() *std.heap.ArenaAllocator {
-                    if (tl_arena == null) {
-                        tl_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-                    }
-                    return &tl_arena.?;
+            fn getArena() *std.heap.ArenaAllocator {
+                if (tl_arena == null) {
+                    tl_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
                 }
+                return &tl_arena.?;
+            }
 
-                pub fn step(self: *Self, path: []const u8) !void {
-                    const arena = getArena();
-                    defer _ = arena.reset(.retain_capacity);
+            pub fn step(self: *Self, path: []const u8) !void {
+                const arena = getArena();
+                defer _ = arena.reset(.retain_capacity);
 
-                    if (processFile(arena.allocator(), path, self.ctx)) |result| {
-                        try self.downstream.step(result);
-                    }
+                if (self.processFile(arena.allocator(), path)) |result| {
+                    try self.downstream.step(result);
                 }
+            }
 
-                pub fn finish(self: *Self) !void {
-                    try self.downstream.finish();
-                }
+            pub fn finish(self: *Self) !void {
+                try self.downstream.finish();
+            }
 
-                fn processFile(tmp: std.mem.Allocator, path: []const u8, ctx: RuntimeContext) ?FileResult {
-                    return processInner(tmp, path, ctx) catch |e| {
-                        if (opts.debug) {
-                            std.debug.print("DEBUG: {s}: {s}\n", .{ path, @errorName(e) });
-                        }
-                        return null;
-                    };
-                }
-
-                fn processInner(tmp: std.mem.Allocator, path: []const u8, ctx: RuntimeContext) !?FileResult {
-                    // File name matching mode
-                    if (opts.file_names) {
-                        if (!engine.matchAny(ctx.pat, path, opts.ignore_case)) return null;
-                        const n = engine.countMatches(ctx.pat, path, opts.ignore_case);
-
-                        if (opts.quiet) return FileResult{ .output = "", .matches = n, .replacements = 0, .changed = false };
-
-                        var buf: std.ArrayListUnmanaged(u8) = .{};
-                        const w = buf.writer(tmp);
-                        if (opts.count) {
-                            try w.print("{f}:{f}\n", .{ ansi.styled(opts.color, .path, path), ansi.styled(opts.color, .line_no, n) });
-                        } else {
-                            try w.print("{f}\n", .{ ansi.styled(opts.color, .path, path) });
-                        }
-                        const output = try tmp.dupe(u8, buf.items);
-                        return FileResult{ .output = output, .matches = n, .replacements = 0, .changed = false };
+            fn processFile(self: *Self, tmp: std.mem.Allocator, path: []const u8) ?FileResult {
+                return self.processInner(tmp, path) catch |e| {
+                    if (self.opts.debug) {
+                        std.debug.print("DEBUG: {s}: {s}\n", .{ path, @errorName(e) });
                     }
+                    return null;
+                };
+            }
 
-                    // Open and map file
-                    var f = std.fs.cwd().openFile(path, .{}) catch return null;
-                    defer f.close();
+            fn processInner(self: *Self, tmp: std.mem.Allocator, path: []const u8) !?FileResult {
+                const opts = self.opts;
 
-                    const stat = f.stat() catch return null;
-                    if (stat.size == 0) return null;
-                    if (stat.size > 1024 * 1024 * 1024) return null; // >1GB
+                // File name matching mode
+                if (opts.file_names) {
+                    if (!engine.matchAny(opts.pat, path, opts.ignore_case)) return null;
+                    const n = engine.countMatches(opts.pat, path, opts.ignore_case);
 
-                    const file_data = mapFile(tmp, f, stat.size) catch return null;
-                    defer unmapFile(tmp, file_data);
-                    const data = file_data.ptr;
+                    if (opts.quiet) return FileResult{ .output = "", .matches = n, .replacements = 0, .changed = false };
 
-                    if (isBinary(data)) return null;
-
-                    // Replace mode
-                    if (opts.replace) {
-                        const repl = ctx.replace_str orelse return null;
-                        const rr = try engine.replaceAll(tmp, ctx.pat, data, repl, opts.ignore_case);
-                        if (rr.n == 0) return null;
-
-                        if (!opts.dry_run) try writeAtomic(tmp, path, rr.out);
-
-                        if (opts.quiet) return FileResult{ .output = "", .matches = 0, .replacements = rr.n, .changed = true };
-
-                        if (opts.dry_run) {
-                            var buf: std.ArrayListUnmanaged(u8) = .{};
-                            _ = try diff.printChangedLines(buf.writer(tmp), opts.color, path, data, rr.out, opts.before, opts.after);
-                            const output = try tmp.dupe(u8, buf.items);
-                            return FileResult{ .output = output, .matches = 0, .replacements = rr.n, .changed = true };
-                        }
-
-                        return FileResult{ .output = "", .matches = 0, .replacements = rr.n, .changed = true };
-                    }
-
-                    // Search mode
-                    const has_context = opts.before > 0 or opts.after > 0;
-                    var out: std.ArrayListUnmanaged(u8) = .{};
-                    const result = try streamMatches(out.writer(tmp), opts.color, opts.heading, has_context, path, ctx.pat, data, opts.before, opts.after, opts.ignore_case, opts.quiet or opts.count, null);
-
-                    if (result.match_count == 0) return null;
-                    if (opts.quiet) return FileResult{ .output = "", .matches = result.match_count, .replacements = 0, .changed = false };
-
+                    var buf: std.ArrayListUnmanaged(u8) = .{};
+                    const w = buf.writer(tmp);
                     if (opts.count) {
-                        out.clearRetainingCapacity();
-                        try out.writer(tmp).print("{f}:{f}\n", .{ ansi.styled(opts.color, .path, path), ansi.styled(opts.color, .line_no, result.match_count) });
+                        try w.print("{f}:{f}\n", .{ ansi.styled(opts.color, .path, path), ansi.styled(opts.color, .line_no, n) });
+                    } else {
+                        try w.print("{f}\n", .{ ansi.styled(opts.color, .path, path) });
+                    }
+                    const output = try tmp.dupe(u8, buf.items);
+                    return FileResult{ .output = output, .matches = n, .replacements = 0, .changed = false };
+                }
+
+                // Open and map file
+                var f = std.fs.cwd().openFile(path, .{}) catch return null;
+                defer f.close();
+
+                const stat = f.stat() catch return null;
+                if (stat.size == 0) return null;
+                if (stat.size > 1024 * 1024 * 1024) return null; // >1GB
+
+                const file_data = mapFile(tmp, f, stat.size) catch return null;
+                defer unmapFile(tmp, file_data);
+                const data = file_data.ptr;
+
+                if (isBinary(data)) return null;
+
+                // Replace mode
+                if (opts.replace) |repl| {
+                    const rr = try engine.replaceAll(tmp, opts.pat, data, repl, opts.ignore_case);
+                    if (rr.n == 0) return null;
+
+                    if (!opts.dry_run) try writeAtomic(tmp, path, rr.out);
+
+                    if (opts.quiet) return FileResult{ .output = "", .matches = 0, .replacements = rr.n, .changed = true };
+
+                    if (opts.dry_run) {
+                        var buf: std.ArrayListUnmanaged(u8) = .{};
+                        _ = try diff.printChangedLines(buf.writer(tmp), opts.color, path, data, rr.out, opts.before, opts.after);
+                        const output = try tmp.dupe(u8, buf.items);
+                        return FileResult{ .output = output, .matches = 0, .replacements = rr.n, .changed = true };
                     }
 
-                    const output = try tmp.dupe(u8, out.items);
-                    return FileResult{ .output = output, .matches = result.match_count, .replacements = 0, .changed = false };
+                    return FileResult{ .output = "", .matches = 0, .replacements = rr.n, .changed = true };
                 }
-            };
-        }
 
-        pub fn wrap(comptime Sink: type, sink: Sink, ctx: RuntimeContext) apply(Sink) {
-            return .{ .downstream = sink, .ctx = ctx };
-        }
-    };
-}
+                // Search mode
+                const has_context = opts.before > 0 or opts.after > 0;
+                var out: std.ArrayListUnmanaged(u8) = .{};
+                const result = try streamMatches(out.writer(tmp), opts.color, opts.heading, has_context, path, opts.pat, data, opts.before, opts.after, opts.ignore_case, opts.quiet or opts.count, null);
+
+                if (result.match_count == 0) return null;
+                if (opts.quiet) return FileResult{ .output = "", .matches = result.match_count, .replacements = 0, .changed = false };
+
+                if (opts.count) {
+                    out.clearRetainingCapacity();
+                    try out.writer(tmp).print("{f}:{f}\n", .{ ansi.styled(opts.color, .path, path), ansi.styled(opts.color, .line_no, result.match_count) });
+                }
+
+                const output = try tmp.dupe(u8, out.items);
+                return FileResult{ .output = output, .matches = result.match_count, .replacements = 0, .changed = false };
+            }
+        };
+    }
+
+    pub fn wrap(comptime Sink: type, sink: Sink, opts: SearchOptions) apply(Sink) {
+        return .{ .downstream = sink, .opts = opts };
+    }
+};
 
 // ============================================================================
 // Output Sink
 // ============================================================================
 
 /// Sink that writes output and accumulates stats
-pub fn OutputSink(comptime opts: PipelineOptions, comptime Writer: type) type {
+pub fn OutputSink(comptime Writer: type) type {
     return struct {
         writer: Writer,
-        mutex: ?*std.Thread.Mutex, // null for single-threaded
+        opts: SearchOptions,
+        mutex: ?*std.Thread.Mutex = null, // null for single-threaded
 
         // Stats
         total_matches: usize = 0,
@@ -231,13 +225,13 @@ pub fn OutputSink(comptime opts: PipelineOptions, comptime Writer: type) type {
             if (result.output.len > 0) {
                 // Write separator if needed
                 if (!self.first_out) {
-                    if (opts.heading) {
+                    if (self.opts.heading) {
                         self.writer.writeByte('\n') catch {
                             self.had_error = true;
                             return;
                         };
-                    } else if (opts.before > 0 or opts.after > 0) {
-                        self.writer.print("{f}\n", .{ansi.styled(opts.color, .dim, "--")}) catch {
+                    } else if (self.opts.before > 0 or self.opts.after > 0) {
+                        self.writer.print("{f}\n", .{ansi.styled(self.opts.color, .dim, "--")}) catch {
                             self.had_error = true;
                             return;
                         };
@@ -256,7 +250,7 @@ pub fn OutputSink(comptime opts: PipelineOptions, comptime Writer: type) type {
 }
 
 // ============================================================================
-// Helper functions (copied from run.zig - could be shared)
+// Helper functions
 // ============================================================================
 
 const FileMap = struct { ptr: []const u8, is_mmap: bool };
@@ -284,13 +278,15 @@ fn isBinary(data: []const u8) bool {
     return std.mem.indexOfScalar(u8, data[0..check_len], 0) != null;
 }
 
+const core_atomic = @import("core/atomic.zig");
+
 fn writeAtomic(allocator: std.mem.Allocator, path: []const u8, data: []const u8) !void {
-    const dir = std.fs.cwd();
-    var atomic = try dir.atomicFile(path, .{});
-    defer atomic.deinit();
-    try atomic.file.writeAll(data);
-    try atomic.finish();
-    _ = allocator;
+    const parent = std.fs.path.dirname(path) orelse ".";
+    const base = std.fs.path.basename(path);
+
+    var d = try std.fs.cwd().openDir(parent, .{});
+    defer d.close();
+    try core_atomic.replaceFileAtomic(allocator, d, base, data);
 }
 
 // Import from run.zig
@@ -298,25 +294,23 @@ const run_impl = @import("run.zig");
 const streamMatches = run_impl.streamMatches;
 
 // ============================================================================
-// Driving the Pipeline
+// Public API
 // ============================================================================
 
-/// Run search/replace on a list of paths
+/// Run search/replace on a list of paths using transducer pipeline
 pub fn search(
-    comptime opts: PipelineOptions,
     paths: []const []const u8,
     writer: anytype,
-    ctx: RuntimeContext,
+    opts: SearchOptions,
 ) !struct { matches: usize, replacements: usize, files_changed: usize } {
-    const Processor = FileProcessor(opts);
-    const Sink = OutputSink(opts, @TypeOf(writer));
+    const Sink = OutputSink(@TypeOf(writer));
 
     const sink = Sink{
         .writer = writer,
-        .mutex = null,
+        .opts = opts,
     };
 
-    var pipeline = Processor.wrap(Sink, sink, ctx);
+    var pipeline = FileProcessor.wrap(Sink, sink, opts);
 
     for (paths) |path| {
         pipeline.step(path) catch |err| {
@@ -360,13 +354,15 @@ test "search basic" {
     // Run search
     var output: std.ArrayListUnmanaged(u8) = .{};
     defer output.deinit(alloc);
-    const writer = output.writer(alloc);
 
     const paths = [_][]const u8{path};
 
     const result = try search(
+        &paths,
+        output.writer(alloc),
         .{
-            .replace = false,
+            .pat = &pat,
+            .replace = null,
             .before = 0,
             .after = 0,
             .color = false,
@@ -378,9 +374,6 @@ test "search basic" {
             .dry_run = false,
             .debug = false,
         },
-        &paths,
-        &writer,
-        .{ .pat = &pat, .replace_str = null },
     );
 
     try std.testing.expectEqual(@as(usize, 2), result.matches);

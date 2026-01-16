@@ -8,6 +8,7 @@ const core_walk = @import("core/walk.zig");
 const core_ignore = @import("core/ignore.zig");
 const ansi = @import("core/ansi.zig");
 const opt = @import("core/opt.zig");
+const search = @import("search.zig");
 
 pub const Options = struct {
     replace: ?[]const u8 = null,
@@ -105,7 +106,7 @@ pub fn run(allocator: std.mem.Allocator, writer: *std.io.Writer, options: anytyp
     try ign.pushDir(cwd, "");
     defer ign.popDir();
 
-    // Sorted mode: collect paths, sort, process sequentially (streaming output, low memory)
+    // Sorted mode: collect paths, sort, process with transducer pipeline
     // Parallel mode: walk and spawn jobs simultaneously
     if (options.sort) {
         var collected_paths: std.ArrayListUnmanaged([]const u8) = .{};
@@ -137,25 +138,33 @@ pub fn run(allocator: std.mem.Allocator, writer: *std.io.Writer, options: anytyp
             }
         }.lt);
 
-        var state = StreamState{
-            .total_matches = 0,
-            .total_repls = 0,
-            .files_changed = 0,
-            .had_error = false,
-            .first_out = true,
+        // Use transducer pipeline
+        const result = search.search(
+            collected_paths.items,
+            writer,
+            .{
+                .pat = &pat,
+                .replace = processed_replace,
+                .before = before,
+                .after = after,
+                .color = use_color,
+                .heading = use_heading,
+                .ignore_case = options.ignore_case,
+                .quiet = options.quiet,
+                .count = options.count,
+                .file_names = options.file_names,
+                .dry_run = options.dry_run,
+                .debug = options.debug,
+            },
+        ) catch |err| switch (err) {
+            error.OutputFailed => return error.JobFailed,
+            else => return err,
         };
-        var arena = std.heap.ArenaAllocator.init(allocator);
-        defer arena.deinit();
-        for (collected_paths.items) |path| {
-            processFile(arena.allocator(), &state, path, &pat, options, use_color, use_heading, before, after, writer);
-            _ = arena.reset(.retain_capacity);
-        }
 
         if (options.replace != null and !options.quiet) {
-            try writer.print("{d} files, {d} replacements\n", .{ state.files_changed, state.total_repls });
+            try writer.print("{d} files, {d} replacements\n", .{ result.files_changed, result.replacements });
         }
-        if (state.had_error) return error.JobFailed;
-        if (state.total_matches == 0 and state.total_repls == 0) return error.NoMatches;
+        if (result.matches == 0 and result.replacements == 0) return error.NoMatches;
         return;
     }
 
