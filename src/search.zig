@@ -1,9 +1,41 @@
 //! Transducer-based search pipeline
 //!
-//! Pipeline: paths -> Keep(processFile) -> OutputSink
+//! Pipeline: paths -> FileProcessor -> OutputSink
 //!
 //! Each file is processed as a unit: open, mmap, search/replace, format, close.
 //! This keeps resource management simple (arena per file).
+//!
+//! ## Making FileProcessor more granular (future work)
+//!
+//! FileProcessor is itself a mini-pipeline:
+//!   path -> open -> mmap -> binary_check -> search/replace -> format -> cleanup
+//!
+//! This could be expressed as composed transducers:
+//! ```
+//! const FilePipeline = Compose(.{
+//!     Keep(openAndMmap),      // path -> ?FileCtx
+//!     Filter(notBinary),      // skip binary files
+//!     Keep(searchOrReplace),  // FileCtx -> ?Matches
+//!     Map(format),            // Matches -> FormattedOutput
+//! });
+//! ```
+//!
+//! The challenge is **resource cleanup** (mmap lifetime, arena reuse):
+//!
+//! Option A: Bracket transducer - `Bracket(acquire, release, inner)`
+//!   Wraps inner pipeline, guarantees release even on error/halt.
+//!   Like Haskell's bracket or Python's context manager.
+//!
+//! Option B: Resource-carrying context - FileCtx flows through with arena,
+//!   final stage calls cleanup. Risk: early termination skips cleanup.
+//!
+//! Option C: RAII wrapper types - MappedFile has deinit(), transducer
+//!   infrastructure calls deinit on scope exit. Needs language support
+//!   or explicit defer in each transform function.
+//!
+//! For now, FileProcessor handles this imperatively with defer.
+//! The granular approach would improve composability (swap search strategy,
+//! add caching, etc.) but adds complexity. Profile first.
 
 const std = @import("std");
 const xf = @import("transducer.zig");
