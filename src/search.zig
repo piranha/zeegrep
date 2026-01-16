@@ -348,7 +348,19 @@ pub const WorkItem = struct {
     opts: *const SearchOptions,
 };
 
-/// A transducer that processes WorkItems (path + opts).
+/// Result with owned output buffer (for parallel mode)
+/// The ArrayList owns its memory and can be moved across threads safely.
+pub const OwnedFileResult = struct {
+    output: std.ArrayListUnmanaged(u8), // owns its memory
+    matches: usize,
+    replacements: usize,
+    changed: bool,
+
+    pub fn deinit(self: *OwnedFileResult, allocator: std.mem.Allocator) void {
+        self.output.deinit(allocator);
+    }
+};
+
 pub const WorkItemProcessor = struct {
     pub fn apply(comptime Downstream: type) type {
         return struct {
@@ -357,16 +369,22 @@ pub const WorkItemProcessor = struct {
             const Self = @This();
 
             pub fn step(self: *Self, item: WorkItem) !void {
-                // Set thread-local opts for this worker
                 tl_opts = item.opts;
 
-                // NOTE: We don't reset arena here because output slices are stored
-                // in result_queue and consumed asynchronously by main thread.
-                // Arena accumulates during worker lifetime - acceptable trade-off.
                 const arena = getArena();
+                defer _ = arena.reset(.retain_capacity);
 
                 if (FileProcessor.processFile(arena.allocator(), item.path)) |result| {
-                    try self.downstream.step(result);
+                    // Create owned buffer and copy output into it
+                    var owned_output: std.ArrayListUnmanaged(u8) = .{};
+                    owned_output.appendSlice(std.heap.page_allocator, result.output) catch return;
+
+                    try self.downstream.step(OwnedFileResult{
+                        .output = owned_output,
+                        .matches = result.matches,
+                        .replacements = result.replacements,
+                        .changed = result.changed,
+                    });
                 }
             }
 
@@ -381,8 +399,53 @@ pub const WorkItemProcessor = struct {
     }
 };
 
+/// Output sink that takes ownership and frees after writing
+fn OwnedOutputSink(comptime Writer: type) type {
+    return struct {
+        writer: Writer,
+        opts: *const SearchOptions,
+        mutex: *std.Thread.Mutex,
+        first_output: bool = true,
+        total_matches: usize = 0,
+        total_repls: usize = 0,
+        files_changed: usize = 0,
+        had_error: bool = false,
+
+        const Self = @This();
+
+        pub fn step(self: *Self, result: OwnedFileResult) !void {
+            // Take ownership, free when done
+            var r = result;
+            defer r.deinit(std.heap.page_allocator);
+
+            self.total_matches += r.matches;
+            self.total_repls += r.replacements;
+            if (r.changed) self.files_changed += 1;
+
+            if (r.output.items.len == 0) return;
+
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            if (!self.first_output and self.opts.heading) {
+                self.writer.writeByte('\n') catch {
+                    self.had_error = true;
+                    return;
+                };
+            }
+            self.first_output = false;
+
+            self.writer.writeAll(r.output.items) catch {
+                self.had_error = true;
+            };
+        }
+
+        pub fn finish(_: *Self) !void {}
+    };
+}
+
 /// Run search/replace in parallel using transducer pipeline.
-/// Uses Parallel transducer with n_workers threads.
+/// Uses owned buffers that move through the pipeline.
 pub fn searchParallel(
     comptime n_workers: usize,
     comptime queue_size: usize,
@@ -391,8 +454,8 @@ pub fn searchParallel(
     opts: *const SearchOptions,
     mutex: *std.Thread.Mutex,
 ) !SearchResult {
-    const Sink = OutputSink(@TypeOf(writer));
-    const ParallelPipeline = xf.Parallel(n_workers, queue_size, WorkItemProcessor, WorkItem, FileResult);
+    const Sink = OwnedOutputSink(@TypeOf(writer));
+    const ParallelPipeline = xf.Parallel(n_workers, queue_size, WorkItemProcessor, WorkItem, OwnedFileResult);
 
     const sink = Sink{
         .writer = writer,
