@@ -489,7 +489,7 @@ fn writeSeparator(state: *StreamState, writer: *std.io.Writer, color: bool, head
 }
 
 /// Stream matches directly to writer - no intermediate MatchLine allocation
-fn streamMatches(
+pub fn streamMatches(
     writer: anytype,
     color: bool,
     heading: bool,

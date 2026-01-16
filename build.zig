@@ -66,8 +66,18 @@ pub fn build(b: *std.Build) void {
     const transducer_tests = b.addTest(.{ .root_module = transducer_test_module });
     const run_transducer_tests = b.addRunArtifact(transducer_tests);
 
+    const search_test_module = b.createModule(.{
+        .root_source_file = b.path("src/search.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const search_tests = b.addTest(.{ .root_module = search_test_module });
+    search_tests.linkLibrary(pcre2_lib);
+    const run_search_tests = b.addRunArtifact(search_tests);
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_opt_tests.step);
     test_step.dependOn(&run_run_tests.step);
     test_step.dependOn(&run_transducer_tests.step);
+    test_step.dependOn(&run_search_tests.step);
 }
