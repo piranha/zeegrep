@@ -123,59 +123,80 @@ fn extractLiteralPrefix(pat: []const u8) []const u8 {
     return pat; // Entire pattern is literal (shouldn't happen if isRegex passed)
 }
 
+/// Decode escaped character, returns the literal char or null if it's a metachar class.
+fn decodeEscape(c: u8) ?u8 {
+    return switch (c) {
+        // Metachar classes - not literal
+        'd', 'D', 'w', 'W', 's', 'S', 'b', 'B', 'A', 'Z', 'z' => null,
+        // Special escapes
+        'n' => '\n',
+        'r' => '\r',
+        't' => '\t',
+        'a' => 0x07, // bell
+        'e' => 0x1B, // escape
+        'f' => 0x0C, // form feed
+        'v' => 0x0B, // vertical tab
+        '0' => 0, // null (simple case, not full octal)
+        // Everything else is literal (escaped metachar or redundant escape)
+        else => c,
+    };
+}
+
 /// Extract the longest literal substring from a regex pattern.
-/// Scans for all literal runs and returns the longest one.
+/// Handles escape sequences: \. becomes '.', \d breaks the run.
+/// Uses static buffer to avoid allocation.
 fn extractLongestLiteral(pat: []const u8) []const u8 {
-    var best_start: usize = 0;
+    const S = struct {
+        var best: [512]u8 = undefined;
+        var current: [512]u8 = undefined;
+    };
+
     var best_len: usize = 0;
-    var run_start: usize = 0;
+    var cur_len: usize = 0;
     var i: usize = 0;
 
     while (i < pat.len) {
         const c = pat[i];
-        const is_meta = switch (c) {
-            '.', '+', '*', '?', '(', ')', '[', ']', '{', '}', '|', '^', '$' => true,
+
+        const advance: struct { skip: usize, literal: ?u8 } = switch (c) {
+            // Regex metacharacters - break the run
+            '.', '+', '*', '?', '(', ')', '[', ']', '{', '}', '|', '^', '$' => .{ .skip = 1, .literal = null },
             '\\' => blk: {
-                // Check if escape sequence is a metachar class
-                if (i + 1 < pat.len) {
-                    const next = pat[i + 1];
-                    break :blk switch (next) {
-                        'd', 'D', 'w', 'W', 's', 'S', 'b', 'B' => true, // char classes
-                        else => true, // treat all escapes as breaking literal for simplicity
-                    };
+                if (i + 1 >= pat.len) break :blk .{ .skip = 1, .literal = null };
+                const next = pat[i + 1];
+                if (decodeEscape(next)) |lit| {
+                    break :blk .{ .skip = 2, .literal = lit };
                 }
-                break :blk true;
+                break :blk .{ .skip = 2, .literal = null }; // metachar class
             },
-            else => false,
+            else => .{ .skip = 1, .literal = c },
         };
 
-        if (is_meta) {
-            // End of literal run
-            const run_len = i - run_start;
-            if (run_len > best_len) {
-                best_start = run_start;
-                best_len = run_len;
+        if (advance.literal) |lit| {
+            // Continue/extend the run
+            if (cur_len < S.current.len) {
+                S.current[cur_len] = lit;
+                cur_len += 1;
             }
-            // Skip past metachar
-            if (c == '\\' and i + 1 < pat.len) {
-                i += 2;
-            } else {
-                i += 1;
-            }
-            run_start = i;
+            i += advance.skip;
         } else {
-            i += 1;
+            // End of run - check if best
+            if (cur_len > best_len) {
+                @memcpy(S.best[0..cur_len], S.current[0..cur_len]);
+                best_len = cur_len;
+            }
+            cur_len = 0;
+            i += advance.skip;
         }
     }
 
     // Check final run
-    const run_len = i - run_start;
-    if (run_len > best_len) {
-        best_start = run_start;
-        best_len = run_len;
+    if (cur_len > best_len) {
+        @memcpy(S.best[0..cur_len], S.current[0..cur_len]);
+        best_len = cur_len;
     }
 
-    return pat[best_start .. best_start + best_len];
+    return S.best[0..best_len];
 }
 
 pub fn matchAny(pat: *const Pattern, hay: []const u8, ignore_case: bool) bool {
@@ -533,6 +554,19 @@ test "extractLongestLiteral" {
     try std.testing.expectEqualStrings("meta", extractLongestLiteral("meta.+se"));
     // No literal
     try std.testing.expectEqualStrings("", extractLongestLiteral(".+"));
+
+    // Escaped metacharacters become literals
+    try std.testing.expectEqualStrings("foo.bar", extractLongestLiteral("foo\\.bar"));
+    try std.testing.expectEqualStrings("foo.bar.baz", extractLongestLiteral("\\d+foo\\.bar\\.baz"));
+    try std.testing.expectEqualStrings("(config)", extractLongestLiteral("\\(config\\)"));
+    try std.testing.expectEqualStrings("path/to/file.txt", extractLongestLiteral("path/to/file\\.txt"));
+    try std.testing.expectEqualStrings("hello-world", extractLongestLiteral("hello\\-world"));
+    // Metachar classes break the run
+    try std.testing.expectEqualStrings("error: ", extractLongestLiteral("error: \\d+"));
+    try std.testing.expectEqualStrings(" in foo.bar", extractLongestLiteral("error: \\d+ in foo\\.bar"));
+    // Special escapes become their chars
+    try std.testing.expectEqualStrings("foo\tbar", extractLongestLiteral("foo\\tbar"));
+    try std.testing.expectEqualStrings("line1\nline2", extractLongestLiteral("line1\\nline2"));
 }
 
 test "multiline pattern disables optimization" {
