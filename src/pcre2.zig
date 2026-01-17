@@ -132,6 +132,24 @@ pub const MatchIterator = struct {
         return .{ .start = start, .end = end };
     }
 
+    /// Match on a slice, reusing match data. Returns span relative to slice start.
+    pub fn matchSlice(self: *MatchIterator, slice: []const u8) ?Span {
+        const md = self.md orelse return null;
+        const rc = c.pcre2_match_8(
+            self.code.code.?,
+            slice.ptr,
+            slice.len,
+            0,
+            0,
+            md,
+            null,
+        );
+        if (rc < 0) return null;
+
+        const ovec = c.pcre2_get_ovector_pointer_8(md);
+        return .{ .start = @intCast(ovec[0]), .end = @intCast(ovec[1]) };
+    }
+
     /// Set position for next iteration (used by optimized wrapper)
     pub fn setPos(self: *MatchIterator, pos: usize) void {
         self.pos = pos;
@@ -159,6 +177,9 @@ pub fn findMatches(allocator: std.mem.Allocator, code: *const Code, subject: []c
 }
 
 pub fn writeHighlighted(on: bool, code: *const Code, writer: anytype, subject: []const u8) !void {
+    // Fast path: no color, just write the line
+    if (!on) return writer.writeAll(subject);
+
     const md = c.pcre2_match_data_create_from_pattern_8(code.code.?, null) orelse return writer.writeAll(subject);
     defer c.pcre2_match_data_free_8(md);
 

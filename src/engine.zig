@@ -3,6 +3,29 @@ const pcre2 = @import("pcre2.zig");
 const ansi = @import("core/ansi.zig");
 const bmh = @import("core/bmh.zig");
 
+/// SIMD-accelerated backward search for newline. stdlib's lastIndexOfScalar is scalar-only.
+fn lastIndexOfNewline(hay: []const u8) ?usize {
+    const Vec = @Vector(32, u8);
+    const nl: Vec = @splat('\n');
+
+    var i = hay.len;
+    while (i >= 32) {
+        const chunk: Vec = hay[i - 32 ..][0..32].*;
+        const matches = chunk == nl;
+        const mask: u32 = @bitCast(matches);
+        if (mask != 0) {
+            return i - 32 + (31 - @clz(mask));
+        }
+        i -= 32;
+    }
+    // Scalar head
+    while (i > 0) {
+        i -= 1;
+        if (hay[i] == '\n') return i;
+    }
+    return null;
+}
+
 pub const Pattern = union(enum) {
     literal: bmh.Matcher,
     regex: OptimizedRegex,
@@ -26,17 +49,17 @@ pub const Pattern = union(enum) {
 };
 
 /// Regex with optional literal optimization.
-/// - prefix: seek literal then run regex from nearby (for non-greedy patterns)
-/// - filter: check if line contains literal before running regex (for greedy patterns)
+/// Seeks literal with BMH, then runs regex on that line only.
+/// If multiple literals exist, uses second as additional filter.
 pub const OptimizedRegex = struct {
     code: pcre2.Code,
-    prefix: ?bmh.Matcher = null, // seek optimization (backtrack-safe patterns)
-    filter: ?bmh.Matcher = null, // line filter (greedy patterns - filter only, no seek)
+    literal: ?bmh.Matcher = null, // primary - used for seeking
+    literal2: ?bmh.Matcher = null, // secondary - additional filter (must also contain)
 
     pub fn deinit(self: *OptimizedRegex) void {
         self.code.deinit();
-        self.prefix = null;
-        self.filter = null;
+        self.literal = null;
+        self.literal2 = null;
     }
 };
 
@@ -47,26 +70,21 @@ pub fn compile(allocator: std.mem.Allocator, pat: []const u8, ignore_case: bool,
 pub fn compileOpts(allocator: std.mem.Allocator, pat: []const u8, ignore_case: bool, dotall: bool, force_literal: bool) !Pattern {
     if (!force_literal and isRegex(pat)) {
         const code = try pcre2.compile(allocator, pat, ignore_case, dotall);
-        const literal_str = extractLongestLiteral(pat);
-        const has_literal = literal_str.len >= 3;
-        const is_greedy = startsWithGreedy(pat);
+        const lits = extractLiterals(pat);
         const is_multiline = containsNewline(pat) or dotall;
 
-        // Choose optimization strategy:
-        // - prefix: safe to seek literal and backtrack (non-greedy, single-line)
-        // - filter: only filter lines by literal, run regex per-line (greedy patterns)
-        // - none: multiline patterns can't use line-based optimization
-        var prefix: ?bmh.Matcher = null;
-        var filter: ?bmh.Matcher = null;
-
-        if (has_literal and !is_multiline) {
-            if (is_greedy) {
-                filter = bmh.Matcher.init(literal_str, ignore_case);
-            } else {
-                prefix = bmh.Matcher.init(literal_str, ignore_case);
+        // Literal optimization: seek literal with BMH, run regex on that line only.
+        // Use second literal as additional filter if available.
+        // Disabled for multiline patterns (can't use line-based optimization).
+        var literal: ?bmh.Matcher = null;
+        var literal2: ?bmh.Matcher = null;
+        if (!is_multiline and lits.first.len >= 3) {
+            literal = bmh.Matcher.init(lits.first, ignore_case);
+            if (lits.second.len >= 3) {
+                literal2 = bmh.Matcher.init(lits.second, ignore_case);
             }
         }
-        return .{ .regex = .{ .code = code, .prefix = prefix, .filter = filter } };
+        return .{ .regex = .{ .code = code, .literal = literal, .literal2 = literal2 } };
     }
     return .{ .literal = bmh.Matcher.init(pat, ignore_case) };
 }
@@ -74,22 +92,6 @@ pub fn compileOpts(allocator: std.mem.Allocator, pat: []const u8, ignore_case: b
 /// Check if pattern contains actual newline - our line-based optimization won't work.
 fn containsNewline(pat: []const u8) bool {
     return std.mem.indexOfScalar(u8, pat, '\n') != null;
-}
-
-/// Check if pattern starts with greedy quantifier that can cause backtracking.
-fn startsWithGreedy(pat: []const u8) bool {
-    if (pat.len < 2) return false;
-    // .+ .* at start
-    if (pat[0] == '.' and (pat[1] == '+' or pat[1] == '*')) return true;
-    // [...]+ [...]*  at start
-    if (pat[0] == '[') {
-        if (std.mem.indexOfScalar(u8, pat, ']')) |end| {
-            if (end + 1 < pat.len and (pat[end + 1] == '+' or pat[end + 1] == '*')) return true;
-        }
-    }
-    // ^.+ ^.*
-    if (pat[0] == '^' and pat.len >= 3 and pat[1] == '.' and (pat[2] == '+' or pat[2] == '*')) return true;
-    return false;
 }
 
 /// Extract literal prefix from regex pattern (bytes before first metachar).
@@ -142,16 +144,23 @@ fn decodeEscape(c: u8) ?u8 {
     };
 }
 
-/// Extract the longest literal substring from a regex pattern.
-/// Handles escape sequences: \. becomes '.', \d breaks the run.
-/// Uses static buffer to avoid allocation.
-fn extractLongestLiteral(pat: []const u8) []const u8 {
+/// Result of literal extraction - up to two literals for filtering
+const ExtractedLiterals = struct {
+    first: []const u8 = "",
+    second: []const u8 = "",
+};
+
+/// Extract up to two longest literal substrings from a regex pattern.
+/// Used for multi-literal filtering (line must contain both).
+fn extractLiterals(pat: []const u8) ExtractedLiterals {
     const S = struct {
-        var best: [512]u8 = undefined;
-        var current: [512]u8 = undefined;
+        var best1: [256]u8 = undefined;
+        var best2: [256]u8 = undefined;
+        var current: [256]u8 = undefined;
     };
 
-    var best_len: usize = 0;
+    var best1_len: usize = 0;
+    var best2_len: usize = 0;
     var cur_len: usize = 0;
     var i: usize = 0;
 
@@ -159,7 +168,6 @@ fn extractLongestLiteral(pat: []const u8) []const u8 {
         const c = pat[i];
 
         const advance: struct { skip: usize, literal: ?u8 } = switch (c) {
-            // Regex metacharacters - break the run
             '.', '+', '*', '?', '(', ')', '[', ']', '{', '}', '|', '^', '$' => .{ .skip = 1, .literal = null },
             '\\' => blk: {
                 if (i + 1 >= pat.len) break :blk .{ .skip = 1, .literal = null };
@@ -167,23 +175,29 @@ fn extractLongestLiteral(pat: []const u8) []const u8 {
                 if (decodeEscape(next)) |lit| {
                     break :blk .{ .skip = 2, .literal = lit };
                 }
-                break :blk .{ .skip = 2, .literal = null }; // metachar class
+                break :blk .{ .skip = 2, .literal = null };
             },
             else => .{ .skip = 1, .literal = c },
         };
 
         if (advance.literal) |lit| {
-            // Continue/extend the run
             if (cur_len < S.current.len) {
                 S.current[cur_len] = lit;
                 cur_len += 1;
             }
             i += advance.skip;
         } else {
-            // End of run - check if best
-            if (cur_len > best_len) {
-                @memcpy(S.best[0..cur_len], S.current[0..cur_len]);
-                best_len = cur_len;
+            // End of run - update best1/best2
+            if (cur_len > best1_len) {
+                // Demote best1 to best2
+                @memcpy(S.best2[0..best1_len], S.best1[0..best1_len]);
+                best2_len = best1_len;
+                // New best1
+                @memcpy(S.best1[0..cur_len], S.current[0..cur_len]);
+                best1_len = cur_len;
+            } else if (cur_len > best2_len) {
+                @memcpy(S.best2[0..cur_len], S.current[0..cur_len]);
+                best2_len = cur_len;
             }
             cur_len = 0;
             i += advance.skip;
@@ -191,12 +205,25 @@ fn extractLongestLiteral(pat: []const u8) []const u8 {
     }
 
     // Check final run
-    if (cur_len > best_len) {
-        @memcpy(S.best[0..cur_len], S.current[0..cur_len]);
-        best_len = cur_len;
+    if (cur_len > best1_len) {
+        @memcpy(S.best2[0..best1_len], S.best1[0..best1_len]);
+        best2_len = best1_len;
+        @memcpy(S.best1[0..cur_len], S.current[0..cur_len]);
+        best1_len = cur_len;
+    } else if (cur_len > best2_len) {
+        @memcpy(S.best2[0..cur_len], S.current[0..cur_len]);
+        best2_len = cur_len;
     }
 
-    return S.best[0..best_len];
+    return .{
+        .first = S.best1[0..best1_len],
+        .second = S.best2[0..best2_len],
+    };
+}
+
+/// Extract the longest literal substring (convenience wrapper)
+fn extractLongestLiteral(pat: []const u8) []const u8 {
+    return extractLiterals(pat).first;
 }
 
 pub fn matchAny(pat: *const Pattern, hay: []const u8, ignore_case: bool) bool {
@@ -205,7 +232,7 @@ pub fn matchAny(pat: *const Pattern, hay: []const u8, ignore_case: bool) bool {
         .literal => |*m| return m.contains(hay),
         .regex => |*r| {
             // Fast path: if literal filter exists and not found, skip regex
-            const lit = r.prefix orelse r.filter;
+            const lit = r.literal;
             if (lit) |*p| {
                 if (!p.contains(hay)) return false;
             }
@@ -219,7 +246,7 @@ pub fn countMatches(pat: *const Pattern, hay: []const u8, ignore_case: bool) usi
     switch (pat.*) {
         .literal => |*m| return m.count(hay),
         .regex => |*r| {
-            const lit = r.prefix orelse r.filter;
+            const lit = r.literal;
             if (lit) |*p| {
                 if (!p.contains(hay)) return 0;
             }
@@ -258,19 +285,16 @@ pub const MatchIterator = union(enum) {
 
 const RegexIterator = struct {
     inner: pcre2.MatchIterator,
-    prefix: ?*const bmh.Matcher, // seek optimization
-    filter: ?*const bmh.Matcher, // line filter optimization
+    literal: ?*const bmh.Matcher,
+    literal2: ?*const bmh.Matcher, // secondary filter
     hay: []const u8,
     pos: usize = 0,
-    // Max chars the pattern can match before the literal (for backtrack limit)
-    // Conservative estimate: 256 chars should cover most practical patterns
-    const MAX_BACKTRACK: usize = 256;
 
     fn init(r: *const OptimizedRegex, hay: []const u8) RegexIterator {
         return .{
             .inner = pcre2.MatchIterator.init(&r.code, hay),
-            .prefix = if (r.prefix) |*p| p else null,
-            .filter = if (r.filter) |*f| f else null,
+            .literal = if (r.literal) |*p| p else null,
+            .literal2 = if (r.literal2) |*p| p else null,
             .hay = hay,
         };
     }
@@ -280,22 +304,18 @@ const RegexIterator = struct {
     }
 
     fn next(self: *RegexIterator) ?Span {
-        // Prefix optimization: seek literal, backtrack limited amount, run regex
-        if (self.prefix) |lit| return self.nextWithPrefix(lit);
-
-        // Filter optimization: scan lines for literal, run regex only on matching lines
-        if (self.filter) |lit| return self.nextWithFilter(lit);
-
+        // Literal optimization: seek literal, run regex on that line only
+        if (self.literal) |lit| return self.nextWithLiteral(lit);
         // No optimization: raw pcre2 iteration
         return self.inner.next();
     }
 
-    /// Seek literal with BMH, back up limited amount, run regex from there.
-    fn nextWithPrefix(self: *RegexIterator, lit: *const bmh.Matcher) ?Span {
+    /// Seek literal with BMH, run regex on that line only.
+    fn nextWithLiteral(self: *RegexIterator, lit: *const bmh.Matcher) ?Span {
         while (true) {
             const lit_pos = lit.indexOfPos(self.hay, self.pos) orelse return null;
 
-            const line_start = if (std.mem.lastIndexOfScalar(u8, self.hay[0..lit_pos], '\n')) |nl|
+            const line_start = if (lastIndexOfNewline(self.hay[0..lit_pos])) |nl|
                 nl + 1
             else
                 0;
@@ -304,54 +324,27 @@ const RegexIterator = struct {
             else
                 self.hay.len;
 
-            const backtrack_limit = if (lit_pos > MAX_BACKTRACK) lit_pos - MAX_BACKTRACK else 0;
-            const search_start = @max(@max(line_start, backtrack_limit), self.inner.pos);
+            const line = self.hay[line_start..line_end];
 
-            if (search_start <= lit_pos) {
-                if (self.inner.nextFrom(search_start)) |span| {
-                    if (span.end <= line_end + 1) {
-                        self.pos = if (span.end > span.start) span.end else span.start + 1;
-                        self.inner.setPos(self.pos);
-                        return span;
-                    }
+            // If we have a second literal, check it's present before running regex
+            if (self.literal2) |lit2| {
+                if (!lit2.contains(line)) {
+                    self.pos = line_end + 1;
+                    continue;
                 }
+            }
+
+            // Run regex on this line only, reusing match data
+            if (self.inner.matchSlice(line)) |span| {
+                self.pos = line_end + 1;
+                return .{
+                    .start = line_start + span.start,
+                    .end = line_start + span.end,
+                };
             }
 
             self.pos = line_end + 1;
-            self.inner.setPos(self.pos);
         }
-    }
-
-    /// Filter lines by literal, run regex only on lines containing the literal.
-    /// For greedy patterns (.+foo.+) where seek optimization would cause backtracking.
-    fn nextWithFilter(self: *RegexIterator, lit: *const bmh.Matcher) ?Span {
-        while (self.pos < self.hay.len) {
-            // Find next line
-            const line_start = self.pos;
-            const line_end = std.mem.indexOfScalarPos(u8, self.hay, line_start, '\n') orelse self.hay.len;
-            const line = self.hay[line_start..line_end];
-
-            // Move to next line for next iteration
-            self.pos = if (line_end < self.hay.len) line_end + 1 else self.hay.len;
-
-            // Skip line if literal not present
-            if (!lit.contains(line)) continue;
-
-            // Run regex on this line only
-            // Create a temporary match on the line slice, but need to return offsets into original hay
-            if (pcre2.matchAny(self.inner.code, line)) {
-                // Get actual match position within line
-                var line_iter = pcre2.MatchIterator.init(self.inner.code, line);
-                defer line_iter.deinit();
-                if (line_iter.next()) |span| {
-                    return .{
-                        .start = line_start + span.start,
-                        .end = line_start + span.end,
-                    };
-                }
-            }
-        }
-        return null;
     }
 };
 
@@ -376,7 +369,7 @@ pub fn findMatches(allocator: std.mem.Allocator, pat: *const Pattern, hay: []con
     switch (pat.*) {
         .literal => |*m| return findMatchesLiteral(allocator, hay, m),
         .regex => |*r| {
-            const lit = r.prefix orelse r.filter;
+            const lit = r.literal;
             if (lit) |*p| {
                 if (!p.contains(hay)) return allocator.alloc(Span, 0);
             }
@@ -415,7 +408,7 @@ pub fn replaceAll(allocator: std.mem.Allocator, pat: *const Pattern, hay: []cons
         },
         .regex => |*r| {
             // For replace, skip if literal not found (no matches possible)
-            const lit = r.prefix orelse r.filter;
+            const lit = r.literal;
             if (lit) |*p| {
                 if (!p.contains(hay)) return .{ .out = try allocator.dupe(u8, hay), .n = 0 };
             }
@@ -545,6 +538,48 @@ test "extractLiteralPrefix" {
     try std.testing.expectEqualStrings("test", extractLiteralPrefix("test*"));
 }
 
+test "lastIndexOfNewline SIMD" {
+    // Empty
+    try std.testing.expectEqual(@as(?usize, null), lastIndexOfNewline(""));
+    // No newline
+    try std.testing.expectEqual(@as(?usize, null), lastIndexOfNewline("hello world"));
+    // Single newline
+    try std.testing.expectEqual(@as(?usize, 5), lastIndexOfNewline("hello\nworld"));
+    // Multiple newlines - returns last
+    try std.testing.expectEqual(@as(?usize, 11), lastIndexOfNewline("hello\nworld\nfoo"));
+    // At end
+    try std.testing.expectEqual(@as(?usize, 5), lastIndexOfNewline("hello\n"));
+    // At start
+    try std.testing.expectEqual(@as(?usize, 0), lastIndexOfNewline("\nhello"));
+    // Longer than 32 bytes (SIMD path)
+    const long = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n";
+    try std.testing.expectEqual(@as(?usize, 67), lastIndexOfNewline(long));
+    // Verify matches stdlib
+    try std.testing.expectEqual(std.mem.lastIndexOfScalar(u8, long, '\n'), lastIndexOfNewline(long));
+}
+
+test "extractLiterals" {
+    // Single literal
+    var lits = extractLiterals("..tabase");
+    try std.testing.expectEqualStrings("tabase", lits.first);
+    try std.testing.expectEqualStrings("", lits.second);
+
+    // Two literals - longest first
+    lits = extractLiterals(".+met.+ase");
+    try std.testing.expectEqualStrings("met", lits.first);
+    try std.testing.expectEqualStrings("ase", lits.second);
+
+    // Three literals - two longest kept
+    lits = extractLiterals("foo.+bar.+baz");
+    try std.testing.expectEqualStrings("foo", lits.first);
+    try std.testing.expectEqualStrings("bar", lits.second); // or baz, both len 3
+
+    // Different lengths
+    lits = extractLiterals(".+metabase.+foo");
+    try std.testing.expectEqualStrings("metabase", lits.first);
+    try std.testing.expectEqualStrings("foo", lits.second);
+}
+
 test "extractLongestLiteral" {
     // Inner literals
     try std.testing.expectEqualStrings("tabase", extractLongestLiteral("..tabase"));
@@ -577,7 +612,7 @@ test "multiline pattern disables optimization" {
     defer pat.deinit();
     // Should be regex and have no literal prefix optimization (multiline match)
     try std.testing.expect(pat == .regex);
-    try std.testing.expect(pat.regex.prefix == null);
+    try std.testing.expect(pat.regex.literal == null);
 
     // Should match across lines
     const hay = "foo\nbar\nbaz";
@@ -597,7 +632,7 @@ test "multiline match with semicolon" {
 
     // Should have no literal prefix optimization (multiline)
     try std.testing.expect(pat == .regex);
-    try std.testing.expect(pat.regex.prefix == null);
+    try std.testing.expect(pat.regex.literal == null);
 
     // Test with actual newline in data
     const data = "return 1;\n}";
@@ -617,8 +652,8 @@ test "inner literal optimization" {
     // Pattern "..tabase" should extract "tabase" as longest literal
     var pat2 = try compile(std.testing.allocator, "..tabase", false, false);
     defer pat2.deinit();
-    try std.testing.expect(pat2.regex.prefix != null);
-    try std.testing.expectEqualStrings("tabase", pat2.regex.prefix.?.needle);
+    try std.testing.expect(pat2.regex.literal != null);
+    try std.testing.expectEqualStrings("tabase", pat2.regex.literal.?.needle);
 }
 
 test "prefix optimization filters non-matches" {
@@ -627,8 +662,8 @@ test "prefix optimization filters non-matches" {
     defer pat.deinit();
 
     // Verify literal was extracted
-    try std.testing.expect(pat.regex.prefix != null);
-    try std.testing.expectEqualStrings("meta", pat.regex.prefix.?.needle);
+    try std.testing.expect(pat.regex.literal != null);
+    try std.testing.expectEqualStrings("meta", pat.regex.literal.?.needle);
 
     // Should match
     try std.testing.expect(matchAny(&pat, "metabase", false));
@@ -735,8 +770,8 @@ test "bench regex literal optimization" {
     defer pat.deinit();
 
     // Verify literal was extracted
-    try std.testing.expect(pat.regex.prefix != null);
-    try std.testing.expectEqualStrings("tabase", pat.regex.prefix.?.needle);
+    try std.testing.expect(pat.regex.literal != null);
+    try std.testing.expectEqualStrings("tabase", pat.regex.literal.?.needle);
 
     var timer = try std.time.Timer.start();
     var count: usize = 0;
@@ -787,8 +822,8 @@ test "bench inner literal seek" {
     var pat = try compile(alloc, "..tabase", false, false);
     defer pat.deinit();
 
-    try std.testing.expect(pat.regex.prefix != null);
-    try std.testing.expectEqualStrings("tabase", pat.regex.prefix.?.needle);
+    try std.testing.expect(pat.regex.literal != null);
+    try std.testing.expectEqualStrings("tabase", pat.regex.literal.?.needle);
 
     var timer = try std.time.Timer.start();
     var count: usize = 0;
@@ -805,39 +840,36 @@ test "bench inner literal seek" {
     try std.testing.expect(ns < 500 * std.time.ns_per_ms);
 }
 
-test "greedy prefix uses filter optimization" {
+test "literal optimization for various patterns" {
     const alloc = std.testing.allocator;
 
-    // .+metabase.+ should use FILTER (not prefix) - greedy prefix causes backtracking
+    // All patterns with 3+ char literal get prefix optimization
     var pat = try compile(alloc, ".+metabase.+", false, false);
     defer pat.deinit();
-    try std.testing.expect(pat.regex.prefix == null);
-    try std.testing.expect(pat.regex.filter != null);
-    try std.testing.expectEqualStrings("metabase", pat.regex.filter.?.needle);
+    try std.testing.expect(pat.regex.literal != null);
+    try std.testing.expectEqualStrings("metabase", pat.regex.literal.?.needle);
 
-    // .*foo should use filter
     var pat2 = try compile(alloc, ".*foo", false, false);
     defer pat2.deinit();
-    try std.testing.expect(pat2.regex.prefix == null);
-    try std.testing.expect(pat2.regex.filter != null);
+    try std.testing.expect(pat2.regex.literal != null);
+    try std.testing.expectEqualStrings("foo", pat2.regex.literal.?.needle);
 
-    // ..tabase SHOULD use prefix (fixed width, safe to backtrack)
     var pat3 = try compile(alloc, "..tabase", false, false);
     defer pat3.deinit();
-    try std.testing.expect(pat3.regex.prefix != null);
-    try std.testing.expect(pat3.regex.filter == null);
+    try std.testing.expect(pat3.regex.literal != null);
+    try std.testing.expectEqualStrings("tabase", pat3.regex.literal.?.needle);
 
-    // meta.+se SHOULD use prefix (literal prefix, safe)
     var pat4 = try compile(alloc, "meta.+se", false, false);
     defer pat4.deinit();
-    try std.testing.expect(pat4.regex.prefix != null);
-    try std.testing.expect(pat4.regex.filter == null);
+    try std.testing.expect(pat4.regex.literal != null);
+    // "meta" is longer than "se"
+    try std.testing.expectEqualStrings("meta", pat4.regex.literal.?.needle);
 }
 
-test "bench greedy prefix filter optimization" {
-    // Greedy prefix patterns (.+X.+) use line filter optimization:
-    // - BMH scans for literal to filter lines
-    // - PCRE2 runs only on lines containing the literal
+test "bench greedy pattern optimization" {
+    // Greedy patterns (.+X.+) use literal optimization:
+    // - BMH seeks literal position
+    // - PCRE2 runs only on that line
     // Compare with raw PCRE2 (no optimization) to show speedup.
     const alloc = std.testing.allocator;
 
@@ -860,10 +892,10 @@ test "bench greedy prefix filter optimization" {
 
     const expected = total_lines / 100; // Only lines with chars before AND after
 
-    // With filter optimization (current behavior)
+    // With literal optimization (current behavior)
     var pat = try compile(alloc, ".+metabase.+", false, false);
     defer pat.deinit();
-    try std.testing.expect(pat.regex.filter != null);
+    try std.testing.expect(pat.regex.literal != null);
 
     var timer = try std.time.Timer.start();
     var count: usize = 0;
