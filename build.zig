@@ -12,6 +12,8 @@ pub fn build(b: *std.Build) void {
     });
     const pcre2_lib = pcre2_dep.artifact("pcre2-8");
 
+    const opt_dep = b.dependency("opt", .{});
+
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", version);
 
@@ -20,6 +22,9 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .strip = optimize != .Debug,
+        .imports = &.{
+            .{ .name = "opt", .module = opt_dep.module("opt") },
+        },
     });
     exe_module.addOptions("build_options", build_options);
     const exe = b.addExecutable(.{
@@ -41,24 +46,18 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run zg");
     run_step.dependOn(&run_cmd.step);
 
-    const opt_test_module = b.createModule(.{
-        .root_source_file = b.path("src/core/opt.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    const opt_tests = b.addTest(.{ .root_module = opt_test_module });
-    const run_opt_tests = b.addRunArtifact(opt_tests);
-
     const run_test_module = b.createModule(.{
         .root_source_file = b.path("src/run.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{
+            .{ .name = "opt", .module = opt_dep.module("opt") },
+        },
     });
     const run_tests = b.addTest(.{ .root_module = run_test_module });
     run_tests.linkLibrary(pcre2_lib);
     const run_run_tests = b.addRunArtifact(run_tests);
 
     const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&run_opt_tests.step);
     test_step.dependOn(&run_run_tests.step);
 }

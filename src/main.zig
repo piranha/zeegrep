@@ -1,10 +1,17 @@
 const std = @import("std");
-const opt = @import("core/opt.zig");
+const opt = @import("opt");
 const run = @import("run.zig");
 const build_options = @import("build_options");
 
 const version = build_options.version;
 const Options = run.Options;
+
+fn usage() void {
+    var buf: [4096]u8 = undefined;
+    var stdout = std.fs.File.stdout().writer(&buf);
+    opt.printUsage(Options, &stdout.interface);
+    stdout.interface.flush() catch {};
+}
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -16,14 +23,14 @@ pub fn main() !void {
 
     const args = argv[1..];
     if (args.len == 0) {
-        opt.usage(Options);
+        usage();
         return;
     }
 
     var options = Options{};
     const rest = opt.parse(Options, &options, args) catch |e| switch (e) {
         error.Help => {
-            opt.usage(Options);
+            usage();
             return;
         },
         error.UnknownOption, error.MissingValue, error.InvalidValue => std.process.exit(1),
@@ -31,12 +38,15 @@ pub fn main() !void {
     };
 
     if (options.version) {
-        std.debug.print("zeegrep {s}\n", .{version});
+        var buf: [64]u8 = undefined;
+        var stdout = std.fs.File.stdout().writer(&buf);
+        stdout.interface.print("zeegrep {s}\n", .{version}) catch {};
+        stdout.interface.flush() catch {};
         return;
     }
 
     if (rest.len == 0) {
-        opt.usage(Options);
+        usage();
         return;
     }
     const pattern = rest[0];
@@ -44,7 +54,7 @@ pub fn main() !void {
     // Parse options from remaining args (options can appear anywhere, mixed with paths)
     const remaining = opt.parse(Options, &options, rest[1..]) catch |e| switch (e) {
         error.Help => {
-            opt.usage(Options);
+            usage();
             return;
         },
         error.UnknownOption, error.MissingValue, error.InvalidValue => std.process.exit(1),

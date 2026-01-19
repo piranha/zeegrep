@@ -7,7 +7,7 @@ const core_atomic = @import("core/atomic.zig");
 const core_walk = @import("core/walk.zig");
 const core_ignore = @import("core/ignore.zig");
 const ansi = @import("core/ansi.zig");
-const opt = @import("core/opt.zig");
+const opt = @import("opt");
 
 const max_file_size = 1 << 30; // 1GB
 const max_parallelism = 3;
