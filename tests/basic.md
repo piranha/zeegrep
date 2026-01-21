@@ -36,3 +36,12 @@ Case insensitive:
     file.txt:1:hello there world
     src/other.txt:1:hello there again
     upper.txt:1:HELLO UPPER
+
+Double dash stops option parsing (pattern can start with -):
+
+    $ echo "--verbose mode" > dashes.txt
+    $ zg -- '--verbose' dashes.txt
+    dashes.txt:1:--verbose mode
+    $ echo "use -i flag" > dashes.txt
+    $ zg -F -- '-i' dashes.txt
+    dashes.txt:1:use -i flag
