@@ -46,6 +46,7 @@ zg old -r new -n          # dry-run (preview diff)
 zg 'foo(\d+)' -r 'bar$1'  # capture groups
 zg pattern -g .zig        # only paths containing ".zig"
 zg pattern -x test        # skip paths containing "test"
+zg foo -a bar -r baz      # files with foo AND bar, replace bar
 ```
 
 ## Compile
@@ -81,6 +82,11 @@ zg pattern -x test            # skip paths containing "test"
 zg pattern -x log -x dist -x vendor # skip multiple
 zg pattern -g clj             # only paths containing "clj"
 zg pattern -g clj -x test     # combine: clj files, skip tests
+
+# AND filter (file must match all patterns)
+zg foo -a bar                 # files containing both foo AND bar
+zg foo -a bar -a baz          # files containing foo AND bar AND baz
+zg foo -a bar -r qux          # replace bar with qux in files with both
 
 # Options
 zg pattern -i                 # case insensitive

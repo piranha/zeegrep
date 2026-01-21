@@ -32,6 +32,7 @@ pub const Options = struct {
     color: ansi.Color = .auto,
     include: opt.Multi([]const u8, 64) = .{},
     exclude: opt.Multi([]const u8, 64) = .{},
+    @"and": opt.Multi([]const u8, 64) = .{},
     version: bool = false,
 
     pub const meta = .{
@@ -54,6 +55,7 @@ pub const Options = struct {
         .color = .{ .help = "Colorize output (auto|always|never)" },
         .include = .{ .short = 'g', .help = "Only paths containing substring (repeatable)" },
         .exclude = .{ .short = 'x', .help = "Skip paths containing substring (repeatable)" },
+        .@"and" = .{ .short = 'a', .help = "Additional pattern (file must match all, repeatable)" },
         .version = .{ .short = 'V', .help = "Show version" },
     };
 
@@ -71,6 +73,7 @@ pub const Options = struct {
         \\  zg old -r new -n           Dry-run, show diff
         \\  zg 'foo(\d+)' -r 'bar$1'   Replace with capture groups
         \\  zg pattern -x test -g clj  Filter paths by substring
+        \\  zg foo -a bar -r baz       Files with foo AND bar, replace bar
         \\
         ,
     };
@@ -81,17 +84,40 @@ pub fn run(allocator: std.mem.Allocator, writer: *std.io.Writer, options: Option
 
     if (options.file_names and options.replace != null) return error.InvalidArgs;
 
-    // Interpret escape sequences in pattern and replacement
-    const processed_pattern = try engine.interpretEscapes(allocator, pattern);
-    defer allocator.free(processed_pattern);
+    // Build list of all patterns: positional first, then --and patterns
+    // The last pattern is the "active" one for replace
+    const and_slice = options.@"and".constSlice();
+    var patterns: [65]engine.Pattern = undefined;
+    var pattern_count: usize = 0;
+    var processed_strs: [65][]const u8 = undefined;
+
+    // Cleanup runs on any exit (success or error)
+    defer for (0..pattern_count) |i| {
+        patterns[i].deinit();
+        allocator.free(processed_strs[i]);
+    };
+
+    // Compile positional pattern
+    processed_strs[0] = try engine.interpretEscapes(allocator, pattern);
+    patterns[0] = try engine.compileOpts(allocator, processed_strs[0], options.ignore_case, options.multiline, options.literal);
+    pattern_count = 1;
+
+    // Compile --and patterns
+    for (and_slice) |and_pat| {
+        processed_strs[pattern_count] = try engine.interpretEscapes(allocator, and_pat);
+        patterns[pattern_count] = try engine.compileOpts(allocator, processed_strs[pattern_count], options.ignore_case, options.multiline, options.literal);
+        pattern_count += 1;
+    }
+
+    const all_patterns = patterns[0..pattern_count];
+    const active_pat = &patterns[pattern_count - 1]; // last pattern for replace
+
+    // Interpret escape sequences in replacement
     const escaped_replace = if (options.replace) |r| try engine.interpretEscapes(allocator, r) else null;
     defer if (escaped_replace) |r| allocator.free(r);
 
-    var pat = try engine.compileOpts(allocator, processed_pattern, options.ignore_case, options.multiline, options.literal);
-    defer pat.deinit();
-
     // For literal patterns, expand $0 to needle once (not per-file)
-    const processed_replace = if (escaped_replace) |r| try pat.expandReplace(allocator, r) else null;
+    const processed_replace = if (escaped_replace) |r| try active_pat.expandReplace(allocator, r) else null;
     defer if (processed_replace) |r| if (r.ptr != (escaped_replace orelse r).ptr) allocator.free(r);
 
     const before: u32 = if (options.context > 0) options.context else options.before;
@@ -150,7 +176,7 @@ pub fn run(allocator: std.mem.Allocator, writer: *std.io.Writer, options: Option
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
         for (collected_paths.items) |path| {
-            processFile(arena.allocator(), &state, path, &pat, options, use_color, use_heading, before, after, writer);
+            processFile(arena.allocator(), &state, path, all_patterns, options, use_color, use_heading, before, after, writer);
             _ = arena.reset(.retain_capacity);
         }
 
@@ -178,7 +204,7 @@ pub fn run(allocator: std.mem.Allocator, writer: *std.io.Writer, options: Option
     const Walker = struct {
         scope: *core_pool.Scope,
         shared: *Shared,
-        pat: *const engine.Pattern,
+        patterns: []const engine.Pattern,
         opts: Options,
         allocator: std.mem.Allocator,
         cwd: std.fs.Dir,
@@ -191,16 +217,16 @@ pub fn run(allocator: std.mem.Allocator, writer: *std.io.Writer, options: Option
                     return;
                 };
                 self.allocator.free(p);
-                self.scope.spawn(Job.run, .{ self.shared, abs, self.opts, self.pat });
+                self.scope.spawn(Job.run, .{ self.shared, abs, self.opts, self.patterns });
             } else {
-                self.scope.spawn(Job.run, .{ self.shared, p, self.opts, self.pat });
+                self.scope.spawn(Job.run, .{ self.shared, p, self.opts, self.patterns });
             }
         }
     };
     var walker = Walker{
         .scope = &scope,
         .shared = &shared,
-        .pat = &pat,
+        .patterns = all_patterns,
         .opts = options,
         .allocator = shared_alloc,
         .cwd = cwd,
@@ -275,11 +301,11 @@ const Shared = struct {
 };
 
 const Job = struct {
-    fn run(thread_id: usize, shared: *Shared, path: []const u8, options: Options, pat: *const engine.Pattern) void {
+    fn run(thread_id: usize, shared: *Shared, path: []const u8, options: Options, patterns: []const engine.Pattern) void {
         defer shared.allocator.free(path); // path was duped by walker
         const arena = shared.pool.arena(thread_id);
         defer _ = arena.reset(.retain_capacity);
-        work(arena.allocator(), shared, path, options, pat) catch |e| {
+        work(arena.allocator(), shared, path, options, patterns) catch |e| {
             if (options.debug) debugSkip(path, @errorName(e));
             shared.fail();
         };
@@ -289,10 +315,15 @@ const Job = struct {
         std.debug.print("DEBUG: {s}: {s}\n", .{ path, reason });
     }
 
-    fn work(tmp: std.mem.Allocator, shared: *Shared, path: []const u8, options: Options, pat: *const engine.Pattern) !void {
+    fn work(tmp: std.mem.Allocator, shared: *Shared, path: []const u8, options: Options, patterns: []const engine.Pattern) !void {
+        const active_pat = &patterns[patterns.len - 1]; // last pattern for replace
+
         if (options.file_names) {
-            if (!engine.matchAny(pat, path, options.ignore_case)) return;
-            const n = engine.countMatches(pat, path, options.ignore_case);
+            // For file names mode, check all patterns match in name (AND filter)
+            for (patterns) |*pat| {
+                if (!engine.matchAny(pat, path, options.ignore_case)) return;
+            }
+            const n = engine.countMatches(active_pat, path, options.ignore_case);
             shared.add(n, 0, false);
             if (options.count and !options.quiet) {
                 var buf: std.ArrayListUnmanaged(u8) = .{};
@@ -339,8 +370,14 @@ const Job = struct {
             return;
         }
 
+        // AND filter: all patterns must match somewhere in file
+        for (patterns) |*pat| {
+            if (!engine.matchAny(pat, data, options.ignore_case)) return;
+        }
+
         if (shared.replace) |repl| {
-            const rr = try engine.replaceAll(tmp, pat, data, repl, options.ignore_case);
+            // Replace only the last (active) pattern
+            const rr = try engine.replaceAll(tmp, active_pat, data, repl, options.ignore_case);
             if (rr.n == 0) return;
 
             if (!options.dry_run) try writeAtomic(tmp, path, rr.out);
@@ -359,7 +396,7 @@ const Job = struct {
 
         // Stream matches to buffer, then output
         var out: std.ArrayListUnmanaged(u8) = .{};
-        const match_count = try streamMatches(out.writer(tmp), shared.color, shared.heading, has_context, path, pat, data, shared.before, shared.after, options.ignore_case, options.quiet or options.count, null);
+        const match_count = try streamMatchesMulti(out.writer(tmp), shared.color, shared.heading, has_context, path, patterns, data, shared.before, shared.after, options.ignore_case, options.quiet or options.count, null);
         if (match_count == 0) return;
         shared.add(match_count, 0, false);
         if (options.quiet) return;
@@ -376,7 +413,7 @@ fn processFile(
     tmp: std.mem.Allocator,
     state: *StreamState,
     path: []const u8,
-    pat: *const engine.Pattern,
+    patterns: []const engine.Pattern,
     options: Options,
     color: bool,
     heading: bool,
@@ -384,7 +421,7 @@ fn processFile(
     after: u32,
     writer: *std.io.Writer,
 ) void {
-    processFileInner(tmp, state, path, pat, options, color, heading, before, after, writer) catch |e| {
+    processFileInner(tmp, state, path, patterns, options, color, heading, before, after, writer) catch |e| {
         if (options.debug) std.debug.print("DEBUG: {s}: {s}\n", .{ path, @errorName(e) });
         state.had_error = true;
     };
@@ -394,7 +431,7 @@ fn processFileInner(
     tmp: std.mem.Allocator,
     state: *StreamState,
     path: []const u8,
-    pat: *const engine.Pattern,
+    patterns: []const engine.Pattern,
     options: Options,
     color: bool,
     heading: bool,
@@ -402,9 +439,14 @@ fn processFileInner(
     after: u32,
     writer: *std.io.Writer,
 ) !void {
+    const active_pat = &patterns[patterns.len - 1]; // last pattern for replace
+
     if (options.file_names) {
-        if (!engine.matchAny(pat, path, options.ignore_case)) return;
-        const n = engine.countMatches(pat, path, options.ignore_case);
+        // AND filter: all patterns must match in file name
+        for (patterns) |*pat| {
+            if (!engine.matchAny(pat, path, options.ignore_case)) return;
+        }
+        const n = engine.countMatches(active_pat, path, options.ignore_case);
         state.total_matches += n;
         if (!options.quiet) {
             try writeSeparator(state, writer, color, heading, before, after);
@@ -430,8 +472,14 @@ fn processFileInner(
 
     if (isBinary(data)) return;
 
+    // AND filter: all patterns must match somewhere in file
+    for (patterns) |*pat| {
+        if (!engine.matchAny(pat, data, options.ignore_case)) return;
+    }
+
     if (options.replace) |repl| {
-        const rr = try engine.replaceAll(tmp, pat, data, repl, options.ignore_case);
+        // Replace only the last (active) pattern
+        const rr = try engine.replaceAll(tmp, active_pat, data, repl, options.ignore_case);
         if (rr.n == 0) return;
 
         if (!options.dry_run) try writeAtomic(tmp, path, rr.out);
@@ -448,7 +496,7 @@ fn processFileInner(
     const has_context = before > 0 or after > 0;
 
     if (options.count) {
-        const match_count = try streamMatches(writer, color, heading, has_context, path, pat, data, before, after, options.ignore_case, true, &state.first_out);
+        const match_count = try streamMatchesMulti(writer, color, heading, has_context, path, patterns, data, before, after, options.ignore_case, true, &state.first_out);
         if (match_count == 0) return;
         state.total_matches += match_count;
         if (options.quiet) return;
@@ -457,7 +505,7 @@ fn processFileInner(
         return;
     }
 
-    const match_count = try streamMatches(writer, color, heading, has_context, path, pat, data, before, after, options.ignore_case, options.quiet, &state.first_out);
+    const match_count = try streamMatchesMulti(writer, color, heading, has_context, path, patterns, data, before, after, options.ignore_case, options.quiet, &state.first_out);
     if (match_count == 0) return;
     state.total_matches += match_count;
     // streamMatches already wrote output with separators
@@ -613,6 +661,197 @@ fn streamMatches(
     }
 
     return match_count;
+}
+
+/// Stream matches from multiple patterns - collects and merges match lines
+fn streamMatchesMulti(
+    writer: anytype,
+    color: bool,
+    heading: bool,
+    has_context: bool,
+    path: []const u8,
+    patterns: []const engine.Pattern,
+    data: []const u8,
+    before: u32,
+    after: u32,
+    ignore_case: bool,
+    count_only: bool,
+    first_out: ?*bool,
+) !usize {
+    // Single pattern: use original fast path
+    if (patterns.len == 1) {
+        return streamMatches(writer, color, heading, has_context, path, &patterns[0], data, before, after, ignore_case, count_only, first_out);
+    }
+
+    // Collect all match line numbers from all patterns
+    const MatchLine = struct { line: usize, offset: usize };
+    var match_lines: std.ArrayListUnmanaged(MatchLine) = .{};
+    defer match_lines.deinit(std.heap.page_allocator);
+
+    var tracker = LineTracker{};
+    for (patterns) |*pat| {
+        var it = engine.MatchIterator.init(pat, data);
+        defer it.deinit();
+        tracker = .{}; // reset for each pattern
+        while (it.next()) |span| {
+            const line = tracker.lineAt(data, span.start);
+            const le = lineStartEnd(data, span.start);
+            match_lines.append(std.heap.page_allocator, .{ .line = line, .offset = le.start }) catch continue;
+        }
+    }
+
+    if (match_lines.items.len == 0) return 0;
+
+    // Sort by line number
+    std.mem.sort(MatchLine, match_lines.items, {}, struct {
+        fn lt(_: void, a: MatchLine, b: MatchLine) bool {
+            return a.line < b.line;
+        }
+    }.lt);
+
+    // Dedupe and output
+    var match_count: usize = 0;
+    var last_emitted: usize = 0;
+    var wrote_heading = false;
+    var wrote_file_sep = false;
+    var pending_after: usize = 0;
+    var prev_line: usize = 0;
+
+    for (match_lines.items) |ml| {
+        if (ml.line == prev_line) continue; // dedupe
+        prev_line = ml.line;
+        match_count += 1;
+
+        if (count_only) continue;
+
+        // Write file separator before first output
+        if (!wrote_file_sep) {
+            if (first_out) |fo| {
+                if (!fo.*) {
+                    if (heading) {
+                        try writer.writeByte('\n');
+                    } else if (has_context) {
+                        try writer.print("{f}\n", .{ansi.styled(color, .dim, "--")});
+                    }
+                }
+                fo.* = false;
+            }
+            wrote_file_sep = true;
+        }
+
+        // Emit pending after-context
+        if (pending_after > 0 and last_emitted > 0) {
+            const ctx_limit = if (before > 0 and before < ml.line) ml.line - before else ml.line;
+            var ctx_line = last_emitted + 1;
+            while (ctx_line < ctx_limit and pending_after > 0) : (ctx_line += 1) {
+                if (lineAtIndex(data, ctx_line)) |text| {
+                    try writeContextLine(writer, color, heading, path, ctx_line, text, &wrote_heading);
+                    last_emitted = ctx_line;
+                }
+                pending_after -= 1;
+            }
+        }
+
+        // Separator for non-contiguous groups
+        if (has_context and last_emitted > 0 and ml.line > last_emitted + 1) {
+            try writer.print("{f}\n", .{ansi.styled(color, .dim, "--")});
+        }
+
+        // Before-context
+        if (before > 0) {
+            const ctx_start = if (before >= ml.line) 1 else ml.line - before;
+            var ctx_line = ctx_start;
+            while (ctx_line < ml.line) : (ctx_line += 1) {
+                if (ctx_line > last_emitted) {
+                    if (lineAtIndex(data, ctx_line)) |text| {
+                        try writeContextLine(writer, color, heading, path, ctx_line, text, &wrote_heading);
+                        last_emitted = ctx_line;
+                    }
+                }
+            }
+        }
+
+        // The match line with multi-pattern highlighting
+        const le = lineStartEnd(data, ml.offset);
+        try writeMatchLineMulti(writer, color, heading, path, ml.line, data[le.start..le.end], patterns, ignore_case, &wrote_heading);
+        last_emitted = ml.line;
+        pending_after = after;
+    }
+
+    // Trailing after-context
+    if (!count_only and pending_after > 0 and last_emitted > 0) {
+        var ctx_line = last_emitted + 1;
+        while (pending_after > 0) : (pending_after -= 1) {
+            if (lineAtIndex(data, ctx_line)) |text| {
+                try writeContextLine(writer, color, heading, path, ctx_line, text, &wrote_heading);
+                ctx_line += 1;
+            } else break;
+        }
+    }
+
+    return match_count;
+}
+
+fn writeMatchLineMulti(writer: anytype, color: bool, heading: bool, path: []const u8, line_no: usize, text: []const u8, patterns: []const engine.Pattern, ignore_case: bool, wrote_heading: *bool) !void {
+    if (heading and !wrote_heading.*) {
+        try writer.print("{f}\n", .{ansi.styled(color, .path, path)});
+        wrote_heading.* = true;
+    }
+    if (!heading) try writer.print("{f}:", .{ansi.styled(color, .path, path)});
+    try writer.print("{f}:", .{ansi.styled(color, .line_no, line_no)});
+    try writeHighlightedMulti(color, patterns, writer, text, ignore_case);
+    try writer.writeByte('\n');
+}
+
+/// Write text with multiple patterns highlighted in different colors
+fn writeHighlightedMulti(on: bool, patterns: []const engine.Pattern, writer: anytype, hay: []const u8, ignore_case: bool) !void {
+    _ = ignore_case;
+
+    if (!on or patterns.len == 0) {
+        try writer.writeAll(hay);
+        return;
+    }
+
+    // Collect all highlight ranges: (start, end, pattern_idx)
+    const Range = struct { start: usize, end: usize, pat_idx: usize };
+    var ranges: std.ArrayListUnmanaged(Range) = .{};
+    defer ranges.deinit(std.heap.page_allocator);
+
+    for (patterns, 0..) |*pat, pat_idx| {
+        var it = engine.MatchIterator.init(pat, hay);
+        defer it.deinit();
+        while (it.next()) |span| {
+            ranges.append(std.heap.page_allocator, .{ .start = span.start, .end = span.end, .pat_idx = pat_idx }) catch continue;
+        }
+    }
+
+    if (ranges.items.len == 0) {
+        try writer.writeAll(hay);
+        return;
+    }
+
+    // Sort by start position
+    std.mem.sort(Range, ranges.items, {}, struct {
+        fn lt(_: void, a: Range, b: Range) bool {
+            return a.start < b.start;
+        }
+    }.lt);
+
+    // Write with highlights, handling overlaps by using first color
+    var pos: usize = 0;
+    for (ranges.items) |r| {
+        if (r.start < pos) continue; // skip overlapping ranges
+        if (r.start > pos) {
+            try writer.writeAll(hay[pos..r.start]);
+        }
+        try writer.writeAll(ansi.matchColor(r.pat_idx));
+        try writer.writeAll(hay[r.start..r.end]);
+        try writer.writeAll(ansi.code(.reset));
+        pos = r.end;
+    }
+    if (pos < hay.len) {
+        try writer.writeAll(hay[pos..]);
+    }
 }
 
 fn writeContextLine(writer: anytype, color: bool, heading: bool, path: []const u8, line_no: usize, text: []const u8, wrote_heading: *bool) !void {

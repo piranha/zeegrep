@@ -55,11 +55,20 @@ pub const OptimizedRegex = struct {
     code: pcre2.Code,
     literal: ?bmh.Matcher = null, // primary - used for seeking
     literal2: ?bmh.Matcher = null, // secondary - additional filter (must also contain)
+    allocator: ?std.mem.Allocator = null, // for freeing literal copies
+    literal_copy: ?[]const u8 = null, // owned copy of literal string
+    literal2_copy: ?[]const u8 = null, // owned copy of literal2 string
 
     pub fn deinit(self: *OptimizedRegex) void {
         self.code.deinit();
+        if (self.allocator) |alloc| {
+            if (self.literal_copy) |lc| alloc.free(lc);
+            if (self.literal2_copy) |lc| alloc.free(lc);
+        }
         self.literal = null;
         self.literal2 = null;
+        self.literal_copy = null;
+        self.literal2_copy = null;
     }
 };
 
@@ -78,13 +87,25 @@ pub fn compileOpts(allocator: std.mem.Allocator, pat: []const u8, ignore_case: b
         // Disabled for multiline patterns (can't use line-based optimization).
         var literal: ?bmh.Matcher = null;
         var literal2: ?bmh.Matcher = null;
+        var literal_copy: ?[]const u8 = null;
+        var literal2_copy: ?[]const u8 = null;
         if (!is_multiline and lits.first.len >= 3) {
-            literal = bmh.Matcher.init(lits.first, ignore_case);
+            // Must copy literals - extractLiterals uses static buffer that gets overwritten
+            literal_copy = try allocator.dupe(u8, lits.first);
+            literal = bmh.Matcher.init(literal_copy.?, ignore_case);
             if (lits.second.len >= 3) {
-                literal2 = bmh.Matcher.init(lits.second, ignore_case);
+                literal2_copy = try allocator.dupe(u8, lits.second);
+                literal2 = bmh.Matcher.init(literal2_copy.?, ignore_case);
             }
         }
-        return .{ .regex = .{ .code = code, .literal = literal, .literal2 = literal2 } };
+        return .{ .regex = .{
+            .code = code,
+            .literal = literal,
+            .literal2 = literal2,
+            .allocator = allocator,
+            .literal_copy = literal_copy,
+            .literal2_copy = literal2_copy,
+        } };
     }
     return .{ .literal = bmh.Matcher.init(pat, ignore_case) };
 }

@@ -15,6 +15,8 @@ zg old -r new -n        # dry-run (preview diff)
 zg 'foo(\d+)' -r 'bar$1'  # capture groups
 zg pattern -g .zig      # only paths containing ".zig"
 zg pattern -x test      # skip paths containing "test"
+zg foo -a bar           # files with both foo AND bar
+zg foo -a bar -r baz    # replace bar in files with foo AND bar
 ```
 
 ## Agent Behavior

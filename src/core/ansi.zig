@@ -34,6 +34,20 @@ pub fn code(style: Style) []const u8 {
     };
 }
 
+// Colors for multiple patterns: red, green, yellow, blue, magenta, cyan
+const match_colors = [_][]const u8{
+    "\x1b[1;31m", // red
+    "\x1b[1;32m", // green
+    "\x1b[1;33m", // yellow
+    "\x1b[1;34m", // blue
+    "\x1b[1;35m", // magenta
+    "\x1b[1;36m", // cyan
+};
+
+pub fn matchColor(pattern_idx: usize) []const u8 {
+    return match_colors[pattern_idx % match_colors.len];
+}
+
 pub fn styled(on: bool, comptime style: Style, value: anytype) Styled(@TypeOf(value)) {
     return .{ .on = on, .value = value, .style = style };
 }
