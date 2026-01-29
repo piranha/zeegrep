@@ -38,7 +38,9 @@ fn walkRoot(
     };
 
     if (st.kind == .directory) {
-        const prefix = if (std.mem.eql(u8, root, ".") or std.mem.eql(u8, root, "./")) "" else root;
+        // Strip trailing slashes to avoid double-slash paths like "src//file.zig"
+        const trimmed = std.mem.trimRight(u8, root, "/");
+        const prefix = if (trimmed.len == 0 or std.mem.eql(u8, trimmed, ".")) "" else trimmed;
         var d = try cwd.openDir(root, .{ .iterate = true });
         defer d.close();
         if (prefix.len != 0) {
