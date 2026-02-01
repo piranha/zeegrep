@@ -20,13 +20,13 @@ Also, I'm just impatient and waiting for an LLM to do replacements one by one...
 
 ```bash
 curl -fsSL https://github.com/piranha/zeegrep/releases/latest/download/zg-$(uname -s)-$(uname -m) \
-  -o ~/.local/bin/zg && chmod +x ~/.local/bin/zg
+  -o ~/bin/zg && chmod +x ~/bin/zg
 ```
 
 Or grab a binary from [releases](https://github.com/piranha/zeegrep/releases).
 
 > [!NOTE]
-> macOS users: if you get a quarantine warning, run `xattr -d com.apple.quarantine ~/.local/bin/zg`
+> macOS users: if you get a quarantine warning, run `xattr -d com.apple.quarantine ~/bin/zg`
 
 ## Claude Code
 
@@ -35,18 +35,21 @@ Add this to your `CLAUDE.md` or `AGENTS.md` to make your coding agent faster at 
 ```markdown
 ## Tools
 
-Use `zg` for code search and replace instead of grep, rg, sed, or manual file editing.
+Use `zg` for code search and replace instead of grep, rg, sed, or manual file
+editing. It uses .gitignore and .rgignore, can search in file names, has
+convenient shortcuts for 'only those files' or 'not those files'.
 
-zg pattern                # search current dir recursively
-zg pattern path/          # search specific path
-zg 'regex' -i             # case-insensitive
-zg -F 'arr['              # literal/fixed strings
-zg old -r new             # replace in-place
-zg old -r new -n          # dry-run (preview diff)
-zg 'foo(\d+)' -r 'bar$1'  # capture groups
-zg pattern -g .zig        # only paths containing ".zig"
-zg pattern -x test        # skip paths containing "test"
-zg foo -a bar -r baz      # files with foo AND bar, replace bar
+zg pattern                 # search current dir recursively
+zg pattern path/           # search specific path
+zg "regex" -i              # case-insensitive
+zg "one|other"             # PCRE syntax
+zg old -r new              # replace in-place
+zg old -r new -n           # dry-run (preview diff)
+zg "foo(\d+)" -r "bar$1"   # capture groups
+zg pattern -g .zig         # only paths containing ".zig"
+zg pattern -x test         # skip paths containing "test"
+zg pattern src -x a -x b   # search for 'pattern' in src except if filename contains 'a' or 'b'
+zg -f pattern              # search for 'pattern' in file name
 ```
 
 ## Compile
@@ -54,14 +57,14 @@ zg foo -a bar -r baz      # files with foo AND bar, replace bar
 ```bash
 # From source
 zig build --release=fast
-cp zig-out/bin/zg ~/.local/bin/
+cp zig-out/bin/zg ~/bin/
 ```
 
 Or:
 
 ```bash
 make release
-cp zig-out/bin/zg ~/.local/bin/
+cp zig-out/bin/zg ~/bin/
 ```
 
 ## Usage
