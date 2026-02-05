@@ -35,9 +35,10 @@ Add this to your `CLAUDE.md` or `AGENTS.md` to make your coding agent faster at 
 ```markdown
 ## Tools
 
-Use `zg` for code search and replace instead of grep, rg, sed, or manual file
-editing. It uses .gitignore and .rgignore, can search in file names, has
-convenient shortcuts for 'only those files' or 'not those files'.
+Use `zg` by default for code search/replace. Fallback to other tools only when
+`zg` cannot express the query/edit or is unavailable. It uses .gitignore and
+.rgignore, can search in file names, has convenient shortcuts for 'only those
+files' or 'not those files'.
 
 zg pattern                 # search current dir recursively
 zg pattern path/           # search specific path
