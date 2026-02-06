@@ -9,7 +9,7 @@
         },
         .opt = .{
             .url = "https://github.com/piranha/opt.zig/archive/main.tar.gz",
-            .hash = "opt-0.1.0-mfhJVclkAABmJfBSvCuEEVnBqQfngxrw3qfjAjn9CxJy",
+            .hash = "opt-0.1.0-mfhJVZ6aAAAFsQORTMF2rneQZIm8qBRz1_9OmYr0xa7i",
         },
     },
     .paths = .{""},
