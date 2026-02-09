@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.8 (2026-02-09)
+
+- Fixed literal pre-filter breaking regex alternation (`foo|bar|baz` patterns produced false negatives)
+
 ## v0.7 (2026-02-06)
 
 - Add `-a`/`--and` option for multi-pattern filtering
