@@ -17,6 +17,36 @@ pub fn build(b: *std.Build) void {
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", version);
 
+    // --- Vendored C dependencies ---
+
+    // tree-sitter runtime
+    const ts_module = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    ts_module.addIncludePath(b.path("deps/tree-sitter/include"));
+    ts_module.addIncludePath(b.path("deps/tree-sitter"));
+    ts_module.addCSourceFile(.{
+        .file = b.path("deps/tree-sitter/lib.c"),
+        .flags = &.{
+            "-std=c11",
+            "-DTREE_SITTER_HIDE_SYMBOLS",
+            "-D_POSIX_C_SOURCE=200112L",
+            "-D_DEFAULT_SOURCE",
+            "-Wno-conversion",
+            "-Wno-sign-conversion",
+        },
+    });
+    const ts_lib = b.addLibrary(.{
+        .name = "tree-sitter",
+        .root_module = ts_module,
+    });
+
+
+
+    // --- Main executable ---
+
     const exe_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -27,11 +57,17 @@ pub fn build(b: *std.Build) void {
         },
     });
     exe_module.addOptions("build_options", build_options);
+
+    // Expose tree-sitter headers to Zig via @cImport
+    exe_module.addIncludePath(b.path("deps/tree-sitter/include"));
+
     const exe = b.addExecutable(.{
         .name = "zg",
         .root_module = exe_module,
     });
     exe.linkLibrary(pcre2_lib);
+    exe.linkLibrary(ts_lib);
+    exe.linkLibC();
     if (output) |out_path| {
         const install = b.addInstallFileWithDir(exe.getEmittedBin(), .prefix, out_path);
         b.getInstallStep().dependOn(&install.step);
@@ -54,8 +90,13 @@ pub fn build(b: *std.Build) void {
             .{ .name = "opt", .module = opt_dep.module("opt") },
         },
     });
+    // Tests also need tree-sitter headers/libs
+    run_test_module.addIncludePath(b.path("deps/tree-sitter/include"));
+
     const run_tests = b.addTest(.{ .root_module = run_test_module });
     run_tests.linkLibrary(pcre2_lib);
+    run_tests.linkLibrary(ts_lib);
+    run_tests.linkLibC();
     const run_run_tests = b.addRunArtifact(run_tests);
 
     const test_step = b.step("test", "Run unit tests");

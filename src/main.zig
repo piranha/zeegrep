@@ -1,6 +1,7 @@
 const std = @import("std");
 const opt = @import("opt");
 const run = @import("run.zig");
+const grammar = run.grammar;
 const build_options = @import("build_options");
 
 const version = build_options.version;
@@ -42,6 +43,36 @@ pub fn main() !void {
         var stdout = std.fs.File.stdout().writer(&buf);
         stdout.interface.print("zeegrep {s}\n", .{version}) catch {};
         stdout.interface.flush() catch {};
+        return;
+    }
+
+    // Handle --list-langs
+    if (options.list_langs) {
+        var buf: [8192]u8 = undefined;
+        var stdout = std.fs.File.stdout().writer(&buf);
+        const cache_dir = grammar.getCacheDir(allocator, options.cache_dir) catch "/tmp/zeegrep/grammars";
+        grammar.listLanguages(allocator, &stdout.interface, cache_dir) catch {};
+        stdout.interface.flush() catch {};
+        return;
+    }
+
+    // Handle --fetch <lang>
+    if (options.fetch) |lang_name| {
+        const cache_dir = grammar.getCacheDir(allocator, options.cache_dir) catch {
+            std.debug.print("Error: could not determine cache directory\n", .{});
+            std.process.exit(2);
+        };
+        defer allocator.free(cache_dir);
+        grammar.fetchGrammar(allocator, lang_name, cache_dir) catch |e| {
+            if (e == error.UnknownLanguage) {
+                std.debug.print("Unknown language: {s}\n", .{lang_name});
+                std.debug.print("Run with --list-langs to see available languages\n", .{});
+            } else {
+                std.debug.print("Failed to fetch grammar: {s}\n", .{@errorName(e)});
+            }
+            std.process.exit(2);
+        };
+        std.debug.print("Grammar '{s}' fetched to {s}/\n", .{ lang_name, cache_dir });
         return;
     }
 

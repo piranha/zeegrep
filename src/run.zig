@@ -8,6 +8,8 @@ const core_walk = @import("core/walk.zig");
 const core_ignore = @import("core/ignore.zig");
 const ansi = @import("core/ansi.zig");
 const opt = @import("opt");
+pub const grammar = @import("grammar.zig");
+const structural = @import("structural.zig");
 
 const max_file_size = 1 << 30; // 1GB
 const max_parallelism = 3;
@@ -34,6 +36,11 @@ pub const Options = struct {
     exclude: opt.Multi([]const u8, 64) = .{},
     @"and": opt.Multi([]const u8, 64) = .{},
     version: bool = false,
+    block: bool = false,
+    lang: ?[]const u8 = null,
+    fetch: ?[]const u8 = null,
+    list_langs: bool = false,
+    cache_dir: ?[]const u8 = null,
 
     pub const meta = .{
         .replace = .{ .short = 'r', .help = "Replacement string (enables replace)" },
@@ -57,6 +64,11 @@ pub const Options = struct {
         .exclude = .{ .short = 'x', .help = "Skip paths containing substring (repeatable)" },
         .@"and" = .{ .short = 'a', .help = "Additional pattern (file must match all, repeatable)" },
         .version = .{ .short = 'V', .help = "Show version" },
+        .block = .{ .short = 'b', .help = "Show full structural block containing match" },
+        .lang = .{ .help = "Force language for tree-sitter (auto-detect by default)" },
+        .fetch = .{ .help = "Pre-download and compile grammar for language" },
+        .list_langs = .{ .help = "Show available languages and cache status" },
+        .cache_dir = .{ .help = "Override grammar cache directory" },
     };
 
     pub const about = .{
@@ -74,6 +86,8 @@ pub const Options = struct {
         \\  zg 'foo(\d+)' -r 'bar$1'   Replace with capture groups
         \\  zg pattern -x test -g clj  Filter paths by substring
         \\  zg foo -a bar -r baz       Files with foo AND bar, replace bar
+        \\  zg pattern -b              Show full structural block (function, class, etc.)
+        \\  zg pattern -b --lang rust  Force language for block detection
         \\
         ,
     };
@@ -392,6 +406,21 @@ const Job = struct {
             return;
         }
 
+        // Block mode: try structural output, fall back to line output
+        if (options.block) {
+            var out: std.ArrayListUnmanaged(u8) = .{};
+            if (try tryBlockMatch(tmp, &out, shared.color, shared.heading, path, patterns, data, &options, @max(shared.before, shared.after))) |br| {
+                shared.add(br.count, 0, false);
+                if (options.quiet) return;
+                if (options.count) {
+                    out.clearRetainingCapacity();
+                    try out.writer(tmp).print("{f}:{f}\n", .{ ansi.styled(shared.color, .path, path), ansi.styled(shared.color, .line_no, br.count) });
+                }
+                if (out.items.len > 0) shared.output(out.items);
+                return;
+            }
+        }
+
         const has_context = shared.before > 0 or shared.after > 0;
 
         // Stream matches to buffer, then output
@@ -493,6 +522,22 @@ fn processFileInner(
         return;
     }
 
+    // Block mode: try structural output, fall back to line output
+    if (options.block) {
+        var block_buf: std.ArrayListUnmanaged(u8) = .{};
+        if (try tryBlockMatch(tmp, &block_buf, color, heading, path, patterns, data, &options, @max(before, after))) |br| {
+            state.total_matches += br.count;
+            if (options.quiet) return;
+            try writeSeparator(state, writer, color, heading, before, after);
+            if (options.count) {
+                try writer.print("{f}:{f}\n", .{ ansi.styled(color, .path, path), ansi.styled(color, .line_no, br.count) });
+            } else {
+                try writer.writeAll(br.buf);
+            }
+            return;
+        }
+    }
+
     const has_context = before > 0 or after > 0;
 
     if (options.count) {
@@ -520,6 +565,154 @@ fn writeSeparator(state: *StreamState, writer: *std.io.Writer, color: bool, head
         }
     }
     state.first_out = false;
+}
+
+/// Detect language from file path extension, or use forced --lang
+fn detectLang(path: []const u8, forced: ?[]const u8) ?[]const u8 {
+    if (forced) |lang| return lang;
+    const ext = std.fs.path.extension(path);
+    if (ext.len == 0) return null;
+    return grammar.langFromExt(ext);
+}
+
+const BlockResult = struct { count: usize, buf: []const u8 };
+
+/// Try block-mode parse+match. Returns null if lang unknown or parse fails (caller falls back).
+fn tryBlockMatch(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    color: bool,
+    heading: bool,
+    path: []const u8,
+    patterns: []const engine.Pattern,
+    data: []const u8,
+    options: *const Options,
+    context: u32,
+) !?BlockResult {
+    const lang_name = detectLang(path, options.lang) orelse return null;
+    const cache_dir = try grammar.getCacheDir(allocator, options.cache_dir);
+    const count = streamBlocks(allocator, out.writer(allocator), color, heading, path, patterns, data, options.ignore_case, options.quiet or options.count, lang_name, cache_dir, context) catch |e| switch (e) {
+        error.BlockFallback => return null,
+        else => return e,
+    };
+    if (count == 0) return null;
+    return .{ .count = count, .buf = out.items };
+}
+
+/// Stream structural blocks containing matches to writer.
+/// Returns number of unique blocks output.
+fn streamBlocks(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    color: bool,
+    heading: bool,
+    path: []const u8,
+    patterns: []const engine.Pattern,
+    data: []const u8,
+    ignore_case: bool,
+    count_only: bool,
+    lang_name: []const u8,
+    cache_dir: []const u8,
+    context: u32,
+) !usize {
+    // Load grammar and parse
+    const lang = grammar.loadGrammar(allocator, lang_name, cache_dir) catch |e| {
+        if (e == error.UnknownLanguage) return error.BlockFallback;
+        // On any grammar load error, fall back to line output
+        return error.BlockFallback;
+    };
+
+    var parser = grammar.Parser.init() catch return error.BlockFallback;
+    defer parser.deinit();
+    parser.setLanguage(lang) catch return error.BlockFallback;
+    const tree = parser.parseString(data) catch return error.BlockFallback;
+    defer grammar.treeDelete(tree);
+
+    // Collect all match offsets
+    var match_offsets: std.ArrayListUnmanaged([2]u32) = .{};
+    defer match_offsets.deinit(allocator);
+
+    for (patterns) |*pat| {
+        var it = engine.MatchIterator.init(pat, data);
+        defer it.deinit();
+        while (it.next()) |span| {
+            try match_offsets.append(allocator, .{ @intCast(span.start), @intCast(span.end) });
+        }
+    }
+
+    if (match_offsets.items.len == 0) return 0;
+
+    // Resolve to structural blocks (deduped)
+    const blocks = try structural.resolveBlocks(allocator, tree, match_offsets.items);
+    defer allocator.free(blocks);
+
+    if (blocks.len == 0) return 0;
+    if (count_only) return blocks.len;
+
+    // Output each block, using same format as normal match output
+    var wrote_heading = false;
+    for (blocks) |block| {
+        const start_line = block.start_line + 1; // tree-sitter is 0-indexed
+        // Extend start to beginning of line to preserve indentation
+        var block_start = block.start_byte;
+        while (block_start > 0 and data[block_start - 1] != '\n') block_start -= 1;
+        const block_text = data[block_start..block.end_byte];
+
+        // Count lines in block for end line number
+        var line_count: u32 = 1;
+        for (block_text) |ch| {
+            if (ch == '\n') line_count += 1;
+        }
+        if (block_text.len > 0 and block_text[block_text.len - 1] == '\n') line_count -= 1;
+
+        const end_line = start_line + line_count - 1;
+
+        if (start_line == end_line) {
+            // Single-line block: use standard match line format
+            try writeMatchLineMulti(writer, color, heading, path, start_line, block_text, patterns, ignore_case, &wrote_heading);
+        } else {
+            // Multi-line block: emit each line with standard match line format
+
+            // Context lines before block
+            if (context > 0) {
+                const ctx_start_line = if (context >= start_line) 1 else start_line - context;
+                if (ctx_start_line < start_line) {
+                    var cur = ctx_start_line;
+                    while (cur < start_line) : (cur += 1) {
+                        if (lineAtIndex(data, cur)) |text| {
+                            try writeContextLine(writer, color, heading, path, cur, text, &wrote_heading);
+                        }
+                    }
+                }
+            }
+
+            var line_start: usize = 0;
+            var cur_line = start_line;
+            for (block_text, 0..) |ch, i| {
+                if (ch == '\n' or i == block_text.len - 1) {
+                    const line_end = if (ch == '\n') i else i + 1;
+                    const line = block_text[line_start..line_end];
+                    try writeMatchLineMulti(writer, color, heading, path, cur_line, line, patterns, ignore_case, &wrote_heading);
+                    line_start = i + 1;
+                    cur_line += 1;
+                }
+            }
+
+            // Context lines after block
+            if (context > 0) {
+                var ctx_line = end_line + 1;
+                var remaining = context;
+                while (remaining > 0) : (remaining -= 1) {
+                    if (lineAtIndex(data, ctx_line)) |text| {
+                        try writeContextLine(writer, color, heading, path, ctx_line, text, &wrote_heading);
+                        ctx_line += 1;
+                    } else break;
+                }
+            }
+        }
+    }
+
+    return blocks.len;
 }
 
 /// Stream matches directly to writer - no intermediate MatchLine allocation
@@ -615,13 +808,6 @@ fn streamMatches(
 
         // The match line(s)
         if (is_multiline) {
-            try writer.print("{f} {f}:{f}-{f} {f}\n", .{
-                ansi.styled(color, .dim, "──"),
-                ansi.styled(color, .path, path),
-                ansi.styled(color, .line_no, start_line),
-                ansi.styled(color, .line_no, end_line),
-                ansi.styled(color, .dim, "──"),
-            });
             multiline_end = end_line;
 
             const block_start = lineStartEnd(data, span.start).start;
@@ -630,10 +816,7 @@ fn streamMatches(
             var cur_line = start_line;
             while (line_start <= block_end) {
                 const le = lineStartEnd(data, line_start);
-                try writer.print("{f}│ {f}\n", .{
-                    ansi.styled(color, .line_no, cur_line),
-                    ansi.styled(color, .match, data[le.start..le.end]),
-                });
+                try writeMatchLine(writer, color, heading, path, cur_line, data[le.start..le.end], pat, ignore_case, &wrote_heading);
                 cur_line += 1;
                 line_start = le.end + 1;
             }
