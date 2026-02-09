@@ -81,15 +81,17 @@ pub fn compileOpts(allocator: std.mem.Allocator, pat: []const u8, ignore_case: b
         const code = try pcre2.compile(allocator, pat, ignore_case, dotall);
         const lits = extractLiterals(pat);
         const is_multiline = containsNewline(pat) or dotall;
+        const has_alternation = hasAlternation(pat);
 
         // Literal optimization: seek literal with BMH, run regex on that line only.
         // Use second literal as additional filter if available.
-        // Disabled for multiline patterns (can't use line-based optimization).
+        // Disabled for multiline patterns (can't use line-based optimization)
+        // and for top-level alternation (literals from different branches aren't conjunctive).
         var literal: ?bmh.Matcher = null;
         var literal2: ?bmh.Matcher = null;
         var literal_copy: ?[]const u8 = null;
         var literal2_copy: ?[]const u8 = null;
-        if (!is_multiline and lits.first.len >= 3) {
+        if (!is_multiline and !has_alternation and lits.first.len >= 3) {
             // Must copy literals - extractLiterals uses static buffer that gets overwritten
             literal_copy = try allocator.dupe(u8, lits.first);
             literal = bmh.Matcher.init(literal_copy.?, ignore_case);
@@ -113,6 +115,23 @@ pub fn compileOpts(allocator: std.mem.Allocator, pat: []const u8, ignore_case: b
 /// Check if pattern contains actual newline - our line-based optimization won't work.
 fn containsNewline(pat: []const u8) bool {
     return std.mem.indexOfScalar(u8, pat, '\n') != null;
+}
+
+/// Check if pattern has alternation (unescaped | outside bracket classes).
+/// Literal extraction across alternation branches produces incorrect filters.
+fn hasAlternation(pat: []const u8) bool {
+    var in_bracket = false;
+    var i: usize = 0;
+    while (i < pat.len) : (i += 1) {
+        switch (pat[i]) {
+            '\\' => i += 1,
+            '[' => in_bracket = true,
+            ']' => in_bracket = false,
+            '|' => if (!in_bracket) return true,
+            else => {},
+        }
+    }
+    return false;
 }
 
 /// Extract literal prefix from regex pattern (bytes before first metachar).
