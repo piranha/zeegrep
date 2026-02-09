@@ -315,6 +315,14 @@ pub fn nodeDescendant(node: TSNode, start: u32, end: u32) TSNode {
     return c.ts_node_descendant_for_byte_range(node, start, end);
 }
 
+pub fn nodeChildCount(node: TSNode) u32 {
+    return c.ts_node_child_count(node);
+}
+
+pub fn nodeChild(node: TSNode, index: u32) TSNode {
+    return c.ts_node_child(node, index);
+}
+
 /// List available languages and their cache status
 pub fn listLanguages(_: std.mem.Allocator, writer: anytype, cache_dir: []const u8) !void {
     try writer.writeAll("Available languages:\n\n");

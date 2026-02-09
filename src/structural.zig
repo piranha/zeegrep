@@ -1,15 +1,29 @@
 const std = @import("std");
 const grammar = @import("grammar.zig");
 
-/// Walk up from a node to find the first named ancestor that covers match_end.
-pub fn findEnclosingBlock(node: grammar.TSNode, match_end: u32) ?grammar.TSNode {
+/// Walk up from a node to find the enclosing structural block.
+/// Prefers the closest multi-line named ancestor strictly larger than
+/// the match. Falls back to the closest single-line ancestor if no
+/// multi-line one exists (e.g. one-liner functions).
+/// Never returns the root node (whole file).
+pub fn findEnclosingBlock(node: grammar.TSNode, match_start: u32, match_end: u32) ?grammar.TSNode {
     var current = grammar.nodeParent(node);
+    var first_larger: ?grammar.TSNode = null;
     while (!grammar.nodeIsNull(current)) {
-        if (grammar.nodeIsNamed(current) and grammar.nodeEndByte(current) >= match_end)
-            return current;
+        const is_root = grammar.nodeIsNull(grammar.nodeParent(current));
+        if (!is_root and grammar.nodeIsNamed(current) and grammar.nodeEndByte(current) >= match_end) {
+            const strictly_larger = grammar.nodeStartByte(current) < match_start or
+                grammar.nodeEndByte(current) > match_end;
+            if (strictly_larger) {
+                if (first_larger == null) first_larger = current;
+                // Multi-line: this is the ideal block
+                if (grammar.nodeStartPoint(current).row < grammar.nodeEndPoint(current).row)
+                    return current;
+            }
+        }
         current = grammar.nodeParent(current);
     }
-    return null;
+    return first_larger;
 }
 
 /// A resolved block: byte range in the source file
@@ -32,7 +46,7 @@ pub fn resolveBlock(
     const leaf = grammar.nodeDescendant(root, match_start, match_start);
     if (grammar.nodeIsNull(leaf)) return null;
 
-    const block_node = findEnclosingBlock(leaf, match_end) orelse return null;
+    const block_node = findEnclosingBlock(leaf, match_start, match_end) orelse return null;
     const start_point = grammar.nodeStartPoint(block_node);
 
     return .{
