@@ -72,7 +72,7 @@ pub fn main() !void {
     }
     const paths = path_buf[0..n_paths];
 
-    var write_buf: [64 * 1024]u8 = undefined;
+    var write_buf: [8 * 1024]u8 = undefined;
     var stdout = std.fs.File.stdout().writer(&write_buf);
     run.run(allocator, &stdout.interface, options, pattern, paths) catch |e| switch (e) {
         error.NoMatches => {
