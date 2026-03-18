@@ -3,7 +3,7 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const version = b.option([]const u8, "version", "Version string") orelse "dev";
+    const version = b.option([]const u8, "version", "Version string") orelse gitVersion(b);
     const output = b.option([]const u8, "output", "Custom output path (e.g., dist/zg-Linux-x86_64)");
 
     const pcre2_dep = b.dependency("pcre2", .{
@@ -60,4 +60,14 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_run_tests.step);
+}
+
+fn gitVersion(b: *std.Build) []const u8 {
+    const result = std.process.Child.run(.{
+        .allocator = b.allocator,
+        .argv = &.{ "git", "describe", "--tags", "--always" },
+        .cwd = b.pathFromRoot("."),
+    }) catch return "dev";
+    if (result.term.Exited != 0) return "dev";
+    return std.mem.trimRight(u8, result.stdout, "\n\r ");
 }
