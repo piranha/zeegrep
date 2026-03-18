@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.9 (2026-03-18)
+
+- Reduced output buffer for more streaming/responsive output
+- Updated opt.zig to pinned v0.1.0 release with bug fixes
+
 ## v0.8 (2026-02-09)
 
 - Fixed literal pre-filter breaking regex alternation (`foo|bar|baz` patterns produced false negatives)
