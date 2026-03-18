@@ -1,8 +1,12 @@
 const std = @import("std");
 
+var tmp_counter = std.atomic.Value(u64).init(0);
+
 pub fn replaceFileAtomic(allocator: std.mem.Allocator, dir: std.fs.Dir, path: []const u8, data: []const u8) !void {
     const ts: i128 = std.time.nanoTimestamp();
-    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(ts))));
+    const cnt = tmp_counter.fetchAdd(1, .monotonic);
+    const seed = @as(u64, @truncate(@as(u128, @bitCast(ts)))) +% cnt;
+    var prng = std.Random.DefaultPrng.init(seed);
     const r = prng.random();
 
     const tmp = try std.fmt.allocPrint(allocator, ".zg-tmp-{x}", .{r.int(u64)});
