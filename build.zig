@@ -65,7 +65,7 @@ pub fn build(b: *std.Build) void {
 fn gitVersion(b: *std.Build) []const u8 {
     const result = std.process.Child.run(.{
         .allocator = b.allocator,
-        .argv = &.{ "git", "describe", "--tags", "--always" },
+        .argv = &.{ "git", "describe", "--tags", "--always", "--dirty=+" },
         .cwd = b.pathFromRoot("."),
     }) catch return "dev";
     if (result.term.Exited != 0) return "dev";
