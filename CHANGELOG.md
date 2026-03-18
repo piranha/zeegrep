@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.10 (2026-03-18)
+
+- Fixed parallel replace silently dropping files due to temp filename collision between threads
+
 ## v0.9 (2026-03-18)
 
 - Reduced output buffer for more streaming/responsive output
