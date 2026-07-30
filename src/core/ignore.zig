@@ -14,74 +14,97 @@ pub fn nameIndex(name: []const u8) ?usize {
     return null;
 }
 
-pub const Stack = struct {
-    allocator: std.mem.Allocator,
-    frames: std.ArrayListUnmanaged(Frame) = .{},
-    rules: std.ArrayListUnmanaged(Rule) = .{},
+/// One directory's ignore rules, linked to the enclosing directory's node.
+/// Immutable once built, so subtrees can be walked concurrently: a walker
+/// only carries the leaf pointer, no shared mutable stack.
+pub const Node = struct {
+    parent: ?*const Node,
+    base: []const u8,
+    rules: []const Rule,
 
-    pub fn init(allocator: std.mem.Allocator) Stack {
-        return .{ .allocator = allocator };
-    }
-
-    pub fn deinit(self: *Stack) void {
-        while (self.frames.items.len > 0) self.popDir();
-        self.frames.deinit(self.allocator);
-        self.rules.deinit(self.allocator);
-        self.* = undefined;
-    }
-
-    /// `found` tells which ignore files the caller saw in the directory listing,
-    /// so we don't pay an openat() per missing one.
-    pub fn pushDir(self: *Stack, dir: std.fs.Dir, base_rel: []const u8, found: Found) !void {
-        const base = try self.allocator.dupe(u8, base_rel);
-        errdefer self.allocator.free(base);
-
-        const frame: Frame = .{ .base = base, .rules_start = self.rules.items.len };
-        try self.frames.append(self.allocator, frame);
-        errdefer {
-            _ = self.frames.pop();
-            self.allocator.free(base);
-        }
-
-        for (names, found) |name, present| {
-            if (present) try self.load(dir, name);
-        }
-    }
-
-    pub fn popDir(self: *Stack) void {
-        const frame = self.frames.pop().?;
-        while (self.rules.items.len > frame.rules_start) {
-            const r = self.rules.pop().?;
-            self.allocator.free(r.pat);
-        }
-        self.allocator.free(frame.base);
-    }
-
-    pub fn ignored(self: *const Stack, rel_path: []const u8, is_dir: bool, hidden: bool) bool {
+    pub fn ignored(node: ?*const Node, rel_path: []const u8, is_dir: bool, hidden: bool) bool {
         if (defaultSkip(rel_path)) return true;
 
         // Dotfiles start as "ignored" unless --hidden; gitignore negation can override
         const name = std.fs.path.basename(rel_path);
-        var ignored_: bool = !hidden and name.len > 0 and name[0] == '.';
+        const start: bool = !hidden and name.len > 0 and name[0] == '.';
+        return apply(node, rel_path, is_dir, start);
+    }
 
-        for (self.rules.items) |r| {
+    /// Outermost rules first, last match wins (gitignore precedence). Recursion
+    /// depth is the number of ancestors that actually have ignore files.
+    fn apply(node: ?*const Node, rel_path: []const u8, is_dir: bool, start: bool) bool {
+        const n = node orelse return start;
+        var ignored_ = apply(n.parent, rel_path, is_dir, start);
+        for (n.rules) |r| {
             if (r.dir_only and !is_dir) continue;
-
-            const base = self.frames.items[r.frame].base;
-            const target = r.target(rel_path, base) orelse continue;
-
+            const target = r.target(rel_path, n.base) orelse continue;
             if (!matchPat(r.pat, r.kind, target, r.anchored or r.has_slash)) continue;
             ignored_ = !r.neg;
         }
         return ignored_;
     }
+};
 
-    fn load(self: *Stack, dir: std.fs.Dir, name: []const u8) !void {
-        const data = dir.readFileAlloc(self.allocator, name, 1 << 20) catch |e| switch (e) {
+/// Owns every Node for the run. Nodes are never freed individually: only
+/// directories that actually contain rules allocate one, so a tree with 169
+/// gitignores costs tens of KB.
+pub const Set = struct {
+    arena: std.heap.ArenaAllocator,
+    mutex: std.Thread.Mutex = .{},
+
+    pub fn init(allocator: std.mem.Allocator) Set {
+        return .{ .arena = std.heap.ArenaAllocator.init(allocator) };
+    }
+
+    pub fn deinit(self: *Set) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+
+    /// Returns the node covering `dir`, or `parent` when `dir` adds no rules.
+    /// `found` tells which ignore files the caller saw in the directory listing,
+    /// so we don't pay an openat() per missing one.
+    pub fn push(self: *Set, parent: ?*const Node, dir: std.fs.Dir, base_rel: []const u8, found: Found) !?*const Node {
+        var any = false;
+        for (found) |f| any = any or f;
+        if (!any) return parent;
+
+        var rules: std.ArrayListUnmanaged(Rule) = .{};
+        const scratch = self.arena.child_allocator;
+
+        // Rules live in the arena, so hold the lock while parsing. Only dirs that
+        // actually have ignore files get here, so contention is negligible.
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const alloc = self.arena.allocator();
+
+        for (names, found) |name, present| {
+            if (present) try load(alloc, scratch, &rules, dir, name);
+        }
+        if (rules.items.len == 0) return parent;
+
+        const node = try alloc.create(Node);
+        node.* = .{
+            .parent = parent,
+            .base = try alloc.dupe(u8, base_rel),
+            .rules = try rules.toOwnedSlice(alloc),
+        };
+        return node;
+    }
+
+    fn load(
+        alloc: std.mem.Allocator,
+        scratch: std.mem.Allocator,
+        rules: *std.ArrayListUnmanaged(Rule),
+        dir: std.fs.Dir,
+        name: []const u8,
+    ) !void {
+        const data = dir.readFileAlloc(scratch, name, 1 << 20) catch |e| switch (e) {
             error.FileNotFound => return,
             else => return e,
         };
-        defer self.allocator.free(data);
+        defer scratch.free(data);
 
         var it = std.mem.splitScalar(u8, data, '\n');
         while (it.next()) |raw| {
@@ -113,9 +136,8 @@ pub const Stack = struct {
                 if (line.len == 0) continue;
             }
 
-            try self.rules.append(self.allocator, .{
-                .frame = self.frames.items.len - 1,
-                .pat = try self.allocator.dupe(u8, line),
+            try rules.append(alloc, .{
+                .pat = try alloc.dupe(u8, line),
                 .neg = neg,
                 .dir_only = dir_only,
                 .anchored = anchored,
@@ -126,13 +148,7 @@ pub const Stack = struct {
     }
 };
 
-const Frame = struct {
-    base: []const u8,
-    rules_start: usize,
-};
-
 const Rule = struct {
-    frame: usize,
     pat: []const u8,
     neg: bool,
     dir_only: bool,
@@ -169,7 +185,7 @@ fn defaultSkip(rel_path: []const u8) bool {
     return false;
 }
 
-test "stack honors per-dir ignore" {
+test "chain honors per-dir ignore" {
     var td = std.testing.tmpDir(.{});
     defer td.cleanup();
 
@@ -178,19 +194,23 @@ test "stack honors per-dir ignore" {
     try td.dir.writeFile(.{ .sub_path = ".gitignore", .data = "*.log\n" });
     try td.dir.writeFile(.{ .sub_path = "a/.gitignore", .data = "!keep.log\n" });
 
-    var st = Stack.init(std.testing.allocator);
-    defer st.deinit();
-    try st.pushDir(td.dir, "", all_found);
+    var set = Set.init(std.testing.allocator);
+    defer set.deinit();
+    const root = try set.push(null, td.dir, "", all_found);
 
-    try std.testing.expect(st.ignored("x.log", false, true));
-    try std.testing.expect(st.ignored("a/x.log", false, true));
+    try std.testing.expect(Node.ignored(root, "x.log", false, true));
+    try std.testing.expect(Node.ignored(root, "a/x.log", false, true));
 
     var a = try td.dir.openDir("a", .{ .iterate = true });
     defer a.close();
-    try st.pushDir(a, "a", all_found);
-    defer st.popDir();
+    const node_a = try set.push(root, a, "a", all_found);
 
-    try std.testing.expect(!st.ignored("a/keep.log", false, true));
-    try std.testing.expect(st.ignored("a/nope.log", false, true));
+    try std.testing.expect(!Node.ignored(node_a, "a/keep.log", false, true));
+    try std.testing.expect(Node.ignored(node_a, "a/nope.log", false, true));
+
+    // A dir without ignore files must not allocate a node
+    var b = try a.openDir("b", .{ .iterate = true });
+    defer b.close();
+    try std.testing.expectEqual(node_a, try set.push(node_a, b, "a/b", .{false} ** names.len));
 }
 

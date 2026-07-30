@@ -129,10 +129,9 @@ pub fn run(allocator: std.mem.Allocator, writer: *std.io.Writer, options: Option
     const use_color = ansi.enabled(options.color, is_tty, no_color != null);
     const use_heading = is_tty and options.replace == null and !options.quiet and !options.count and !options.file_names and isMultiPathSearch(cwd, paths);
 
-    var ign = core_ignore.Stack.init(allocator);
-    defer ign.deinit();
-    try ign.pushDir(cwd, "", core_ignore.all_found);
-    defer ign.popDir();
+    var ign_set = core_ignore.Set.init(allocator);
+    defer ign_set.deinit();
+    const ign_root = try ign_set.push(null, cwd, "", core_ignore.all_found);
 
     // Sorted mode: collect paths, sort, process sequentially (streaming output, low memory)
     // Parallel mode: walk and spawn jobs simultaneously
@@ -158,7 +157,7 @@ pub fn run(allocator: std.mem.Allocator, writer: *std.io.Writer, options: Option
             }
         };
         var collector = PathCollector{ .paths = &collected_paths, .alloc = allocator, .cwd = cwd, .use_abs = options.abs };
-        try core_walk.walkFiles(allocator, cwd, &ign, paths, options.include.constSlice(), options.exclude.constSlice(), options.hidden, true, &collector);
+        try core_walk.walkFiles(allocator, cwd, &ign_set, ign_root, paths, options.include.constSlice(), options.exclude.constSlice(), options.hidden, true, &collector);
 
         std.mem.sort([]const u8, collected_paths.items, {}, struct {
             fn lt(_: void, a: []const u8, b: []const u8) bool {
@@ -231,7 +230,7 @@ pub fn run(allocator: std.mem.Allocator, writer: *std.io.Writer, options: Option
         .allocator = shared_alloc,
         .cwd = cwd,
     };
-    try core_walk.walkFiles(allocator, cwd, &ign, paths, options.include.constSlice(), options.exclude.constSlice(), options.hidden, false, &walker);
+    try core_walk.walkFiles(allocator, cwd, &ign_set, ign_root, paths, options.include.constSlice(), options.exclude.constSlice(), options.hidden, false, &walker);
     scope.wait();
 
     if (options.replace != null and !options.quiet) {
