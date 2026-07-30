@@ -1,21 +1,12 @@
 # Changelog
 
-## Unreleased
+## v1.0 (2026-07-30)
 
-- Fixed overlapping path arguments (`zg pat . src`) visiting files more than
-  once, which made `-r` apply the replacement twice to the same file
-- Fixed `.gitignore` of an explicitly given directory being ignored
-  (`zg pat src/` did not apply `src/.gitignore`)
-
-- Perf: parallel directory walk (2 threads while searching, 6 for `-f`, which
-  never opens files). `-f` listing is 3.2-4.4x faster than v0.10
-- Perf: 1.2-1.5x faster search, 1.8x faster directory walk
-  - libc malloc instead of Zig's debug allocator (it serialized every path dupe
-    and job closure on one mutex)
-  - read() into a reused arena buffer for files <64KB instead of mmap+munmap,
-    which serializes threads on the process address-space lock
-  - detect ignore files from the directory listing instead of a blind openat()
-    per candidate per directory
+- Parallel directory walk: `-f` name listing is 3.2-4.4x faster (82k-file tree: 266ms to 69ms)
+- 1.2-1.7x faster content search: libc malloc instead of Zig's debug allocator, `read()` into a reused buffer for files under 64KB instead of `mmap`, and ignore files detected from the directory listing instead of a blind `openat()` per directory
+- Fixed overlapping path arguments (`zg pat . src`) visiting files twice, which made `-r` apply the replacement twice to the same file
+- Fixed `.gitignore` of an explicitly given directory being ignored (`zg pat src/` did not apply `src/.gitignore`)
+- `zg -V` reports `git describe` output for local builds, with `+` when the working copy is dirty
 
 ## v0.10 (2026-03-18)
 
