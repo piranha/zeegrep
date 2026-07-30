@@ -1,6 +1,19 @@
 const std = @import("std");
 const glob = @import("glob.zig");
 
+/// Per-directory ignore files, in load order.
+pub const names = [_][]const u8{ ".gitignore", ".rgignore", ".ignore" };
+pub const Found = [names.len]bool;
+pub const all_found: Found = .{true} ** names.len;
+
+/// Index into `names` if `name` is an ignore file.
+pub fn nameIndex(name: []const u8) ?usize {
+    for (names, 0..) |n, i| {
+        if (std.mem.eql(u8, name, n)) return i;
+    }
+    return null;
+}
+
 pub const Stack = struct {
     allocator: std.mem.Allocator,
     frames: std.ArrayListUnmanaged(Frame) = .{},
@@ -17,7 +30,9 @@ pub const Stack = struct {
         self.* = undefined;
     }
 
-    pub fn pushDir(self: *Stack, dir: std.fs.Dir, base_rel: []const u8) !void {
+    /// `found` tells which ignore files the caller saw in the directory listing,
+    /// so we don't pay an openat() per missing one.
+    pub fn pushDir(self: *Stack, dir: std.fs.Dir, base_rel: []const u8, found: Found) !void {
         const base = try self.allocator.dupe(u8, base_rel);
         errdefer self.allocator.free(base);
 
@@ -28,9 +43,9 @@ pub const Stack = struct {
             self.allocator.free(base);
         }
 
-        try self.load(dir, ".gitignore");
-        try self.load(dir, ".rgignore");
-        try self.load(dir, ".ignore");
+        for (names, found) |name, present| {
+            if (present) try self.load(dir, name);
+        }
     }
 
     pub fn popDir(self: *Stack) void {
@@ -165,14 +180,14 @@ test "stack honors per-dir ignore" {
 
     var st = Stack.init(std.testing.allocator);
     defer st.deinit();
-    try st.pushDir(td.dir, "");
+    try st.pushDir(td.dir, "", all_found);
 
     try std.testing.expect(st.ignored("x.log", false, true));
     try std.testing.expect(st.ignored("a/x.log", false, true));
 
     var a = try td.dir.openDir("a", .{ .iterate = true });
     defer a.close();
-    try st.pushDir(a, "a");
+    try st.pushDir(a, "a", all_found);
     defer st.popDir();
 
     try std.testing.expect(!st.ignored("a/keep.log", false, true));

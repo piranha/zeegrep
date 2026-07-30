@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- Fixed `.gitignore` of an explicitly given directory being ignored
+  (`zg pat src/` did not apply `src/.gitignore`)
+
+- Perf: 1.2-1.5x faster search, 1.8x faster directory walk
+  - libc malloc instead of Zig's debug allocator (it serialized every path dupe
+    and job closure on one mutex)
+  - read() into a reused arena buffer for files <64KB instead of mmap+munmap,
+    which serializes threads on the process address-space lock
+  - detect ignore files from the directory listing instead of a blind openat()
+    per candidate per directory
+
 ## v0.10 (2026-03-18)
 
 - Fixed parallel replace silently dropping files due to temp filename collision between threads

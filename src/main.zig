@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const opt = @import("opt");
 const run = @import("run.zig");
 const build_options = @import("build_options");
@@ -14,9 +15,13 @@ fn usage() void {
 }
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    // libc malloc has per-thread caches; the debug allocator serializes every
+    // path dupe/job closure on one mutex (~40% of walk time on big trees).
+    var dbg: std.heap.DebugAllocator(.{}) = .init;
+    defer if (builtin.mode == .Debug) {
+        _ = dbg.deinit();
+    };
+    const allocator = if (builtin.mode == .Debug) dbg.allocator() else std.heap.c_allocator;
 
     const argv = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, argv);

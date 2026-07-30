@@ -131,7 +131,7 @@ pub fn run(allocator: std.mem.Allocator, writer: *std.io.Writer, options: Option
 
     var ign = core_ignore.Stack.init(allocator);
     defer ign.deinit();
-    try ign.pushDir(cwd, "");
+    try ign.pushDir(cwd, "", core_ignore.all_found);
     defer ign.popDir();
 
     // Sorted mode: collect paths, sort, process sequentially (streaming output, low memory)
@@ -358,7 +358,7 @@ const Job = struct {
             return;
         }
 
-        const file_data = mapFile(f, stat.size) catch |e| {
+        const file_data = mapFile(tmp, f, stat.size) catch |e| {
             if (options.debug) debugSkip(path, @errorName(e));
             return;
         };
@@ -466,7 +466,7 @@ fn processFileInner(
     if (stat.size == 0) return;
     if (stat.size > max_file_size) return;
 
-    const file_data = mapFile(f, stat.size) catch return;
+    const file_data = mapFile(tmp, f, stat.size) catch return;
     defer unmapFile(file_data);
     const data = file_data.ptr;
 
@@ -952,10 +952,25 @@ fn isBinary(data: []const u8) bool {
 
 const FileData = struct {
     ptr: []const u8,
+    mapped: bool = true,
     section_handle: if (builtin.os.tag == .windows) std.os.windows.HANDLE else void = if (builtin.os.tag == .windows) undefined else {},
 };
 
-fn mapFile(f: std.fs.File, size: u64) !FileData {
+/// Files below this size are read into a (reused) arena buffer: cheaper than
+/// mmap+munmap, which serializes on the process address-space lock across threads.
+const small_file_max = 64 * 1024;
+
+fn mapFile(tmp: std.mem.Allocator, f: std.fs.File, size: u64) !FileData {
+    if (size <= small_file_max) {
+        const buf = try tmp.alloc(u8, size);
+        var off: usize = 0;
+        while (off < size) {
+            const n = try f.read(buf[off..]);
+            if (n == 0) break;
+            off += n;
+        }
+        return .{ .ptr = buf[0..off], .mapped = false };
+    }
     if (comptime builtin.os.tag == .windows) {
         const w = std.os.windows;
         var section_handle: w.HANDLE = undefined;
@@ -998,6 +1013,7 @@ fn mapFile(f: std.fs.File, size: u64) !FileData {
 }
 
 fn unmapFile(fd: FileData) void {
+    if (!fd.mapped) return; // arena-owned, freed on reset
     if (comptime builtin.os.tag == .windows) {
         const w = std.os.windows;
         _ = w.ntdll.NtUnmapViewOfSection(w.GetCurrentProcess(), @ptrFromInt(@intFromPtr(fd.ptr.ptr)));
