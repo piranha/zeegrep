@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Fixed overlapping path arguments (`zg pat . src`) visiting files more than
+  once, which made `-r` apply the replacement twice to the same file
 - Fixed `.gitignore` of an explicitly given directory being ignored
   (`zg pat src/` did not apply `src/.gitignore`)
 

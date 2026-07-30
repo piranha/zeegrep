@@ -37,6 +37,18 @@ Actual replace modifies files:
     little and small
     new and new
 
+Overlapping paths replace each file once, not once per path:
+
+    $ mkdir -p dup/inner
+    $ echo "aa" > dup/x.txt
+    $ echo "aa" > dup/inner/y.txt
+    $ zg aa -r aaa dup dup/inner dup/
+    2 files, 2 replacements
+    $ cat dup/x.txt
+    aaa
+    $ cat dup/inner/y.txt
+    aaa
+
 Replace with capture groups:
 
     $ echo "foo123 and foo456" > capture.txt

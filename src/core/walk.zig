@@ -107,8 +107,14 @@ pub fn walkFiles(
 
     if (paths.len == 0) {
         try seedRoot(&w, node, ".", ctx);
-    } else for (paths) |root| {
-        try seedRoot(&w, node, root, ctx);
+    } else {
+        // Overlapping roots (`zg pat . src`) would otherwise list a directory
+        // twice, which for --replace means replacing in the same file twice.
+        const keep = try rootsToWalk(allocator, cwd, paths);
+        defer allocator.free(keep);
+        for (paths, keep) |root, wanted| {
+            if (wanted) try seedRoot(&w, node, root, ctx);
+        }
     }
     if (w.q.items.items.len == 0) return;
 
@@ -136,6 +142,45 @@ pub fn walkFiles(
     }
     Worker.run(&w, ctx);
     for (extra[0..spawned]) |t| t.join();
+}
+
+/// Marks which roots to actually walk: drops exact duplicates and roots nested
+/// inside another root. Comparison is on resolved paths, so "src", "./src/" and
+/// an absolute path to it are recognized as the same place.
+fn rootsToWalk(allocator: std.mem.Allocator, cwd: std.fs.Dir, paths: []const []const u8) ![]bool {
+    const keep = try allocator.alloc(bool, paths.len);
+    @memset(keep, true);
+    if (paths.len < 2) return keep;
+
+    const real = try allocator.alloc(?[]u8, paths.len);
+    defer {
+        for (real) |r| if (r) |p| allocator.free(p);
+        allocator.free(real);
+    }
+    for (paths, real) |p, *r| r.* = cwd.realpathAlloc(allocator, p) catch null;
+
+    for (real, 0..) |ri, i| {
+        const a = ri orelse continue; // unresolvable: leave it to seedRoot to report
+        for (real, 0..) |rj, j| {
+            if (i == j) continue;
+            const b = rj orelse continue;
+            // Equal paths: keep the first occurrence only
+            const nested = if (std.mem.eql(u8, a, b)) j < i and keep[j] else contains(b, a);
+            if (nested) {
+                keep[i] = false;
+                break;
+            }
+        }
+    }
+    return keep;
+}
+
+/// True when `child` is strictly inside directory `parent` (both resolved).
+fn contains(parent: []const u8, child: []const u8) bool {
+    if (child.len <= parent.len) return false;
+    if (!std.mem.startsWith(u8, child, parent)) return false;
+    if (std.mem.eql(u8, parent, "/")) return true;
+    return child[parent.len] == '/';
 }
 
 fn seedRoot(w: *Walk, node: ?*const ignore.Node, root: []const u8, ctx: anytype) !void {
@@ -318,6 +363,36 @@ test "include does not prune directories" {
 
     try std.testing.expectEqual(@as(usize, 1), collector.files.items.len);
     try std.testing.expect(std.mem.endsWith(u8, collector.files.items[0], "src/run.zig"));
+}
+
+test "overlapping roots are walked once" {
+    var td = std.testing.tmpDir(.{});
+    defer td.cleanup();
+
+    try td.dir.makePath("sub/deep");
+    try td.dir.writeFile(.{ .sub_path = "top.txt", .data = "x\n" });
+    try td.dir.writeFile(.{ .sub_path = "sub/a.txt", .data = "x\n" });
+    try td.dir.writeFile(.{ .sub_path = "sub/deep/b.txt", .data = "x\n" });
+
+    const cases = [_][]const []const u8{
+        &.{ ".", "sub" },
+        &.{ "sub", "." },
+        &.{ "sub", "sub", "sub/deep" },
+        &.{ "./sub/", "sub" },
+    };
+    const expected = [_]usize{ 3, 3, 2, 2 };
+
+    for (cases, expected) |roots, want| {
+        var set = ignore.Set.init(std.testing.allocator);
+        defer set.deinit();
+        const root = try set.push(null, td.dir, "", ignore.all_found);
+
+        var collector = TestCollector{ .alloc = std.testing.allocator };
+        defer collector.deinit();
+
+        try walkFiles(std.testing.allocator, td.dir, &set, root, roots, &.{}, &.{}, false, 4, &collector);
+        try std.testing.expectEqual(want, collector.files.items.len);
+    }
 }
 
 test "parallel walk finds every file in a deep tree" {
