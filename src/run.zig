@@ -11,6 +11,14 @@ const opt = @import("opt");
 
 const max_file_size = 1 << 30; // 1GB
 const max_parallelism = 3;
+/// Directory-listing threads. macOS serializes hard on VFS locks, so the budget
+/// of threads doing filesystem calls is what matters, not the core count:
+/// beyond ~3 concurrent openers, system time explodes and wall time with it.
+/// -f never opens files, so the walk gets the whole budget; when searching
+/// contents the job pool needs it, and extra walkers only steal from it
+/// (measured: 6 walkers + search = 15% slower than 2).
+const walk_threads_listing = 6;
+const walk_threads_search = 2;
 
 pub const Options = struct {
     replace: ?[]const u8 = null,
@@ -147,17 +155,20 @@ pub fn run(allocator: std.mem.Allocator, writer: *std.io.Writer, options: Option
             alloc: std.mem.Allocator,
             cwd: std.fs.Dir,
             use_abs: bool,
+            mu: std.Thread.Mutex = .{},
 
             pub fn onFile(self: *@This(), path: []const u8) void {
                 const p = if (self.use_abs)
                     self.cwd.realpathAlloc(self.alloc, path) catch return
                 else
                     self.alloc.dupe(u8, path) catch return;
+                self.mu.lock();
+                defer self.mu.unlock();
                 self.paths.append(self.alloc, p) catch self.alloc.free(p);
             }
         };
         var collector = PathCollector{ .paths = &collected_paths, .alloc = allocator, .cwd = cwd, .use_abs = options.abs };
-        try core_walk.walkFiles(allocator, cwd, &ign_set, ign_root, paths, options.include.constSlice(), options.exclude.constSlice(), options.hidden, true, &collector);
+        try core_walk.walkFiles(allocator, cwd, &ign_set, ign_root, paths, options.include.constSlice(), options.exclude.constSlice(), options.hidden, walk_threads_search, &collector);
 
         std.mem.sort([]const u8, collected_paths.items, {}, struct {
             fn lt(_: void, a: []const u8, b: []const u8) bool {
@@ -188,8 +199,9 @@ pub fn run(allocator: std.mem.Allocator, writer: *std.io.Writer, options: Option
     }
 
     // Parallel mode
-    var ts = std.heap.ThreadSafeAllocator{ .child_allocator = allocator };
-    const shared_alloc = ts.allocator();
+    // Both base allocators (libc malloc in release, DebugAllocator in debug) are
+    // already thread-safe; a ThreadSafeAllocator here would just add a mutex.
+    const shared_alloc = allocator;
 
     var pool: core_pool.Pool = .{};
     const n_jobs = @min(max_parallelism, std.Thread.getCpuCount() catch max_parallelism);
@@ -230,7 +242,7 @@ pub fn run(allocator: std.mem.Allocator, writer: *std.io.Writer, options: Option
         .allocator = shared_alloc,
         .cwd = cwd,
     };
-    try core_walk.walkFiles(allocator, cwd, &ign_set, ign_root, paths, options.include.constSlice(), options.exclude.constSlice(), options.hidden, false, &walker);
+    try core_walk.walkFiles(allocator, cwd, &ign_set, ign_root, paths, options.include.constSlice(), options.exclude.constSlice(), options.hidden, if (options.file_names) walk_threads_listing else walk_threads_search, &walker);
     scope.wait();
 
     if (options.replace != null and !options.quiet) {

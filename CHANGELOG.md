@@ -5,6 +5,8 @@
 - Fixed `.gitignore` of an explicitly given directory being ignored
   (`zg pat src/` did not apply `src/.gitignore`)
 
+- Perf: parallel directory walk (2 threads while searching, 6 for `-f`, which
+  never opens files). `-f` listing is 3.2-4.4x faster than v0.10
 - Perf: 1.2-1.5x faster search, 1.8x faster directory walk
   - libc malloc instead of Zig's debug allocator (it serialized every path dupe
     and job closure on one mutex)
