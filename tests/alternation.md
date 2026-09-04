@@ -48,6 +48,22 @@ Case-insensitive alternation:
     data.txt:5:alpha test
     data.txt:6:beta test
 
+Anchored alternation with nested capture replacement:
+
+    $ cat << EOF > physics.md
+    > header
+    > - G1.1 OPEN
+    > - G1.2 OPEN
+    > - G1.3 OPEN
+    > EOF
+    $ zg '^- (G1\.(1|2)) OPEN' -r '$1 CLOSED' physics.md
+    1 files, 2 replacements
+    $ cat physics.md
+    header
+    G1.1 CLOSED
+    G1.2 CLOSED
+    - G1.3 OPEN
+
 Escaped pipe is literal, not alternation:
 
     $ echo "a|b" >> data.txt
